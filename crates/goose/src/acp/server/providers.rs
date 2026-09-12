@@ -1126,6 +1126,7 @@ impl GooseAcpAgent {
                 let provider_id = req.provider_id.clone();
                 let announce: Box<dyn Fn(String, String, u64) + Send + Sync> =
                     Box::new(move |user_code, verification_uri, expires_in| {
+                        #[cfg(feature = "clipboard")]
                         let _ = arboard::Clipboard::new()
                             .ok()
                             .and_then(|mut cb| cb.set_text(&user_code).ok());

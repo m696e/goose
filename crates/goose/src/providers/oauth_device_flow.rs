@@ -351,10 +351,13 @@ fn announce_user_action(device: &DeviceCodeResponse) {
         return;
     }
 
+    #[cfg(feature = "clipboard")]
     let copied = arboard::Clipboard::new()
         .ok()
         .and_then(|mut cb| cb.set_text(&device.user_code).ok())
         .is_some();
+    #[cfg(not(feature = "clipboard"))]
+    let copied = false;
     if let Err(e) = webbrowser::open(&verify_url) {
         tracing::warn!("Failed to open browser: {}", e);
     }

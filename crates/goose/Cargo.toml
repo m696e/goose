@@ -55,6 +55,7 @@ aws-providers = [
 cuda = ["local-inference", "candle-core/cuda", "candle-nn/cuda", "goose-providers/cuda"]
 vulkan = ["local-inference", "goose-providers/vulkan"]
 mlx = ["local-inference", "goose-providers/mlx"]
+clipboard = ["dep:arboard"]
 rustls-tls = [
     "dep:rustls",
     "dep:rcgen",
@@ -124,7 +125,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-unix-socket",
 ] }
 oauth2 = { version = "5.0", default-features = false }
-arboard = { workspace = true }
+arboard = { workspace = true, optional = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
