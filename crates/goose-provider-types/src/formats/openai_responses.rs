@@ -25,6 +25,7 @@ use std::collections::HashSet;
 pub struct ResponsesApiResponse {
     pub id: String,
     pub object: String,
+    #[serde(default)]
     pub created_at: i64,
     pub status: String,
     pub model: String,
@@ -174,22 +175,26 @@ impl ResponseUsage {
 pub enum ResponsesStreamEvent {
     #[serde(rename = "response.created")]
     ResponseCreated {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.in_progress")]
     ResponseInProgress {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded {
+        #[serde(default)]
         sequence_number: i32,
         output_index: i32,
         item: ResponseOutputItemInfo,
     },
     #[serde(rename = "response.content_part.added")]
     ContentBlockPartAdded {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -198,6 +203,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -210,12 +216,14 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
+        #[serde(default)]
         sequence_number: i32,
         output_index: i32,
         item: ResponseOutputItemInfo,
     },
     #[serde(rename = "response.content_part.done")]
     ContentBlockPartDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -224,6 +232,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_text.done")]
     OutputTextDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -234,18 +243,25 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.completed")]
     ResponseCompleted {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.failed")]
-    ResponseFailed { sequence_number: i32, error: Value },
+    ResponseFailed {
+        #[serde(default)]
+        sequence_number: i32,
+        error: Value,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -255,6 +271,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -262,6 +279,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -270,6 +288,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.refusal.done")]
     RefusalDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -337,6 +356,7 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
 pub struct ResponseMetadata {
     pub id: String,
     pub object: String,
+    #[serde(default)]
     pub created_at: i64,
     pub status: String,
     pub model: String,
@@ -3346,5 +3366,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("invalid arguments"));
+    }
+
+    #[test]
+    fn test_parse_qubax_response_created_no_created_at() {
+        // Qubax proxy emits response.created events without created_at and
+        // without sequence_number.  Verify we tolerate that (serde(default)).
+        let data = r#"{"type":"response.created","response":{"id":"resp_qubax","object":"response","status":"in_progress","model":"gpt-5.6-sol"}}"#;
+        let event = parse_responses_stream_event(data)
+            .expect("should parse")
+            .expect("should be Some");
+        match event {
+            ResponsesStreamEvent::ResponseCreated {
+                sequence_number,
+                response,
+            } => {
+                assert_eq!(sequence_number, 0, "default for missing i32");
+                assert_eq!(response.id, "resp_qubax");
+                assert_eq!(response.model, "gpt-5.6-sol");
+                assert_eq!(response.status, "in_progress");
+                assert_eq!(response.created_at, 0, "default for missing i64");
+            }
+            _ => panic!("expected ResponseCreated variant"),
+        }
     }
 }
