@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::conversation::token_usage::{CostSource, ProviderUsage};
 use crate::http_status::read_json_response;
 use crate::images::ImageFormat;
@@ -9,6 +11,7 @@ use reqwest::Response;
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::pin;
+use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -23,6 +26,16 @@ use crate::formats::openai::{
     record_response_metadata, response_to_message, response_to_streaming_message,
     OpenAiFormatOptions,
 };
+
+const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
+
+fn chunk_timeout() -> Duration {
+    let secs = std::env::var("GOOSE_INFERENCE_CHUNK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 use crate::formats::openai_responses::responses_api_to_streaming_message;
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
@@ -247,7 +260,11 @@ pub fn stream_openai_compat(
 
         let message_stream = response_to_streaming_message(framed);
         pin!(message_stream);
-        while let Some(message) = message_stream.next().await {
+        while let Some(message) = timeout(chunk_timeout(), message_stream.next()).await.map_err(|_| {
+            ProviderError::NetworkError(
+                "Stream timed out waiting for next chunk — check your network connection".to_string()
+            )
+        })? {
             let (message, usage) = message.map_err(|e|
                 e.downcast::<ProviderError>()
                     .unwrap_or_else(ProviderError::stream_decode_error)
@@ -271,7 +288,11 @@ pub fn stream_responses_compat(
 
         let message_stream = responses_api_to_streaming_message(framed);
         pin!(message_stream);
-        while let Some(message) = message_stream.next().await {
+        while let Some(message) = timeout(chunk_timeout(), message_stream.next()).await.map_err(|_| {
+            ProviderError::NetworkError(
+                "Stream timed out waiting for next chunk — check your network connection".to_string()
+            )
+        })? {
             let (message, usage) = message.map_err(|e|
                 e.downcast::<ProviderError>()
                     .unwrap_or_else(ProviderError::stream_decode_error)

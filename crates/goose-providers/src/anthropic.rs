@@ -11,7 +11,9 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 use tokio::pin;
+use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
@@ -26,6 +28,16 @@ use super::formats::anthropic::{
 };
 use super::openai_compatible::handle_status;
 use super::retry::ProviderRetry;
+const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
+
+fn chunk_timeout() -> Duration {
+    let secs = std::env::var("GOOSE_INFERENCE_CHUNK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use rmcp::model::Tool;
@@ -248,7 +260,11 @@ impl AnthropicProvider {
             let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
             let messages = response_to_streaming_message(framed);
             pin!(messages);
-            while let Some(message) = futures::StreamExt::next(&mut messages).await {
+            while let Some(message) = timeout(chunk_timeout(), futures::StreamExt::next(&mut messages)).await.map_err(|_| {
+                ProviderError::NetworkError(
+                    "Stream timed out waiting for next chunk — check your network connection".to_string()
+                )
+            })? {
                 let (message, usage) = message.map_err(ProviderError::from_stream_error)?;
                 if let Some(transformations) = usage
                     .as_ref()
