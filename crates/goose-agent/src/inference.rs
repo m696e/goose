@@ -1,6 +1,7 @@
 //! Provider inference operation for the unrolled agent loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -74,6 +75,55 @@ pub trait InferenceEffect: From<Message> + MaybeSend + 'static {
 const EMPTY_RESPONSE_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const CANCELLED_TOOL_RESPONSE: &str = "Tool call was cancelled before execution";
+
+/// Default maximum number of automatic retry attempts when the provider's
+/// stream fails with a transient error (network drop, server error).
+const DEFAULT_MAX_STREAM_RETRIES: u32 = 5;
+
+/// Text sent to the model after a recovered stream interruption, asking it to
+/// continue from where it left off rather than starting over.
+const STREAM_CONTINUE_MESSAGE: &str = "network was interrupted. continue.";
+
+fn max_stream_retries() -> u32 {
+    std::env::var("GOOSE_INFERENCE_STREAM_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_STREAM_RETRIES)
+}
+
+/// Returns `true` for transient provider errors that warrant an automatic
+/// stream retry rather than aborting the turn.
+fn should_retry_stream(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::NetworkError(_) | ProviderError::ServerError(_)
+    )
+}
+
+/// A stream may be retried only while the attempt budget lasts and the partial
+/// output has not produced a tool request — resuming mid-tool-call would leave
+/// an unanswered request in the conversation.
+fn can_retry_stream(
+    err: &ProviderError,
+    attempt: u32,
+    max_retries: u32,
+    accumulator: &Conversation,
+) -> bool {
+    should_retry_stream(err)
+        && attempt < max_retries
+        && !accumulator.messages().iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+        })
+}
+
+/// Exponential backoff for stream retries: 500ms → 1s → 2s → capped at 10s.
+fn retry_backoff(attempt: u32) -> Duration {
+    let ms = std::cmp::min(500u64 * 2u64.pow(attempt), 10_000);
+    Duration::from_millis(ms)
+}
 
 fn is_thinking(content: &MessageContent) -> bool {
     matches!(
@@ -419,30 +469,6 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                 }
             }
 
-            let projected =
-                Conversation::new_unvalidated(messages_for_provider).agent_visible_messages();
-            let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
-            let conversation_for_provider = Conversation::new_unvalidated(
-                merge_consecutive_messages_for_request(fixed.messages().clone()),
-            );
-            let stream = self
-                .provider
-                .stream(
-                    &self.model_config,
-                    &system_prompt,
-                    conversation_for_provider.messages(),
-                    &tools,
-                )
-                .await;
-
-            let mut stream = match stream {
-                Ok(stream) => stream,
-                Err(err) => {
-                    usage_effects.extend(self.error_outcome(&err, emit).await);
-                    return applied(usage_effects);
-                }
-            };
-
             let requested_model = self.model_config.model_name.clone();
             let resolved_model = self
                 .provider
@@ -462,54 +488,110 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
             let mut tool_request_ids = std::collections::HashSet::new();
             let mut provider_usage = None;
             let mut cancelled = false;
+            let mut attempt = 0u32;
+            let max_retries = max_stream_retries();
+
             loop {
-                tokio::select! {
-                    biased;
-                    _ = emit.cancelled() => {
-                        cancelled = true;
-                        break;
-                    },
-                    next = stream.next() => {
-                        let Some(result) = next else { break };
-                        let (msg_opt, usage_opt) = match result {
-                            Ok(chunk) => chunk,
-                            Err(err) => {
-                                if let Some(usage) = provider_usage {
-                                    usage_effects.push(E::record_usage(usage));
-                                }
-                                usage_effects.extend(accumulator.into_iter().map(E::from));
-                                usage_effects.extend(self.error_outcome(&err, emit).await);
-                                return applied(usage_effects);
-                            }
-                        };
-                        if let Some(usage) = usage_opt {
-                            let span = tracing::Span::current();
-                            record_chat_usage(&span, &usage);
-                            provider_usage = Some(usage);
+                // Rebuild the request each attempt: after an interruption the
+                // model's partial output is replayed so it can continue instead
+                // of starting over.
+                let mut attempt_messages = messages_for_provider.clone();
+                attempt_messages.extend(accumulator.messages().iter().cloned());
+                if attempt > 0 {
+                    attempt_messages.push(Message::user().with_text(STREAM_CONTINUE_MESSAGE));
+                }
+                let projected =
+                    Conversation::new_unvalidated(attempt_messages).agent_visible_messages();
+                let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
+                let conversation_for_provider = Conversation::new_unvalidated(
+                    merge_consecutive_messages_for_request(fixed.messages().clone()),
+                );
+
+                let stream = self
+                    .provider
+                    .stream(
+                        &self.model_config,
+                        &system_prompt,
+                        conversation_for_provider.messages(),
+                        &tools,
+                    )
+                    .await;
+
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        if can_retry_stream(&err, attempt, max_retries, &accumulator) {
+                            attempt += 1;
+                            tokio::time::sleep(retry_backoff(attempt)).await;
+                            continue;
                         }
-                        if let Some(mut chunk) = msg_opt {
-                            if let Some(inference) = &inference {
-                                chunk = chunk.with_inference_if_assistant(inference.clone());
+                        usage_effects.extend(self.error_outcome(&err, emit).await);
+                        return applied(usage_effects);
+                    }
+                };
+
+                let mut interrupted = None;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = emit.cancelled() => {
+                            cancelled = true;
+                            break;
+                        },
+                        next = stream.next() => {
+                            let Some(result) = next else { break };
+                            let (msg_opt, usage_opt) = match result {
+                                Ok(chunk) => chunk,
+                                Err(err) => {
+                                    interrupted = Some(err);
+                                    break;
+                                }
+                            };
+                            if let Some(usage) = usage_opt {
+                                let span = tracing::Span::current();
+                                record_chat_usage(&span, &usage);
+                                provider_usage = Some(usage);
                             }
-                            chunk.content.retain(|content| match content {
-                                MessageContent::ToolRequest(request) => {
-                                    tool_request_ids.insert(request.id.clone())
+                            if let Some(mut chunk) = msg_opt {
+                                if let Some(inference) = &inference {
+                                    chunk = chunk.with_inference_if_assistant(inference.clone());
                                 }
-                                _ => true,
-                            });
-                            drop_repeated_tool_call_thinking(&accumulator, &mut chunk);
-                            if chunk.content.is_empty() {
-                                if chunk.metadata.output_token_limit_reached {
-                                    chunk = emit.message(chunk).await;
+                                chunk.content.retain(|content| match content {
+                                    MessageContent::ToolRequest(request) => {
+                                        tool_request_ids.insert(request.id.clone())
+                                    }
+                                    _ => true,
+                                });
+                                drop_repeated_tool_call_thinking(&accumulator, &mut chunk);
+                                if chunk.content.is_empty() {
+                                    if chunk.metadata.output_token_limit_reached {
+                                        chunk = emit.message(chunk).await;
+                                    }
+                                    accumulator.push(chunk);
+                                    continue;
                                 }
+                                let chunk = emit.message(chunk).await;
                                 accumulator.push(chunk);
-                                continue;
                             }
-                            let chunk = emit.message(chunk).await;
-                            accumulator.push(chunk);
                         }
                     }
                 }
+
+                let Some(err) = interrupted else { break };
+                if can_retry_stream(&err, attempt, max_retries, &accumulator) {
+                    attempt += 1;
+                    if let Some(usage) = provider_usage.take() {
+                        usage_effects.push(E::record_usage(usage));
+                    }
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    continue;
+                }
+                if let Some(usage) = provider_usage.take() {
+                    usage_effects.push(E::record_usage(usage));
+                }
+                usage_effects.extend(accumulator.into_iter().map(E::from));
+                usage_effects.extend(self.error_outcome(&err, emit).await);
+                return applied(usage_effects);
             }
 
             if let Some(usage) = provider_usage {
