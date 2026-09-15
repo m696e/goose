@@ -1,6 +1,6 @@
 use crate::formats::openai::{
-    extract_reasoning_effort, is_openai_responses_model, is_xai_reasoning_model,
-    supports_xai_reasoning_effort,
+    extract_reasoning_effort, is_deepseek_reasoning_model, is_openai_responses_model,
+    is_xai_reasoning_model, supports_xai_reasoning_effort,
 };
 use crate::thinking::ThinkingEffort;
 use serde::de::Deserializer;
@@ -312,6 +312,7 @@ impl ModelConfig {
             || Self::is_gemini3_reasoning_model_name(&self.model_name)
             || self.is_glm_5_3_reasoning_model()
             || self.is_kimi_k3_reasoning_model()
+            || is_deepseek_reasoning_model(&self.model_name)
             || is_xai_reasoning_model(&self.model_name)
     }
 
@@ -1025,6 +1026,15 @@ mod tests {
             assert!(ModelConfig::new("grok-4.5").is_reasoning_model());
             assert!(ModelConfig::new("grok-4.20-0309-reasoning").is_reasoning_model());
             assert!(!ModelConfig::new("grok-4.20-0309-non-reasoning").is_reasoning_model());
+            assert!(ModelConfig::new("deepseek-v4-pro").is_reasoning_model());
+            assert!(ModelConfig::new("qubax/deepseek-v4-pro").is_reasoning_model());
+            assert!(ModelConfig::new("deepseek-v4-flash").is_reasoning_model());
+            assert!(ModelConfig::new("deepseek-reasoner").is_reasoning_model());
+            assert!(ModelConfig::new("deepseek-r1").is_reasoning_model());
+            assert!(!ModelConfig::new("deepseek-chat").is_reasoning_model());
+            assert!(!ModelConfig::new("deepseek-v3.2").is_reasoning_model());
+            assert!(!ModelConfig::new("qwen3.5-9b-uncensored").is_reasoning_model());
+            assert!(!ModelConfig::new("qwen3-coder-30b-a3b").is_reasoning_model());
         }
 
         #[test]

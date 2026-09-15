@@ -251,6 +251,22 @@ pub fn format_messages_with_options(
     let mut tool_call_turn_reasoning = String::new();
     let mut saw_tool_response = false;
 
+    // DeepSeek (and other always-on thinking models) require `reasoning_content`
+    // to be present on every assistant message once a conversation is in thinking
+    // mode — even for turns where the model emitted no reasoning of its own. Detect
+    // that state from the history so non-reasoning models (e.g. local qwen) are
+    // never given an empty `reasoning_content`.
+    let conversation_has_thinking = options.preserve_thinking_context
+        && messages.iter().any(|m| {
+            m.role == Role::Assistant
+                && m.content.iter().any(|c| {
+                    matches!(
+                        c,
+                        MessageContentBlock::Thinking(_) | MessageContentBlock::RedactedThinking(_)
+                    )
+                })
+        });
+
     for message in messages {
         if options.preserve_thinking_context && message.role != Role::Assistant {
             pending_assistant_reasoning.clear();
@@ -536,10 +552,17 @@ pub fn format_messages_with_options(
             }
         }
 
-        // Include reasoning_content only when non-empty. Kimi rejects empty
-        // reasoning_content (""), so we must omit it entirely.
-        if options.preserve_thinking_context && !reasoning_text.is_empty() {
-            converted.reasoning_content = Some(reasoning_text);
+        // Include reasoning_content on assistant messages when non-empty. DeepSeek
+        // requires the field on every assistant message while in thinking mode, so
+        // when the history shows thinking, also emit an empty field for tool-call
+        // messages that produced no reasoning of their own. Kimi rejects empty
+        // reasoning_content, but Kimi tool-call turns always carry their own
+        // reasoning, so this empty branch never fires for it.
+        if options.preserve_thinking_context && message.role == Role::Assistant {
+            let has_tool_calls = converted.tool_calls.as_ref().is_some_and(|a| !a.is_empty());
+            if !reasoning_text.is_empty() || (has_tool_calls && conversation_has_thinking) {
+                converted.reasoning_content = Some(reasoning_text);
+            }
         }
 
         if has_message_payload {
@@ -1765,6 +1788,10 @@ pub fn create_request_for_model_with_options(
         model_config
             .thinking_effort()
             .and_then(|effort| xai_reasoning_effort_for_thinking(&model_name, effort))
+    } else if is_deepseek_reasoning_model(&model_name) {
+        model_config
+            .thinking_effort()
+            .and_then(|effort| deepseek_reasoning_effort_for_thinking(&model_name, effort))
     } else {
         None
     };
@@ -1909,6 +1936,35 @@ pub fn is_xai_reasoning_model(model_name: &str) -> bool {
         || model_name.starts_with("grok-4-0709")
         || model_name.starts_with("grok-4-fast-reasoning")
         || model_name.starts_with("grok-4-1-fast-reasoning")
+}
+
+/// Returns whether a DeepSeek model performs server-side reasoning.
+///
+/// DeepSeek V4 (`deepseek-v4-pro` / `deepseek-v4-flash`) enables thinking by
+/// default, and the `reasoner` / R1 lines are thinking-only. `deepseek-chat`
+/// (V3) is deliberately excluded as a non-reasoning model.
+pub fn is_deepseek_reasoning_model(model_name: &str) -> bool {
+    let name = model_name.to_ascii_lowercase();
+    if !name.contains("deepseek") {
+        return false;
+    }
+    name.contains("v4") || name.contains("reasoner") || name.contains("r1")
+}
+
+/// Maps Goose's effort levels to values accepted by DeepSeek's OpenAI-compatible
+/// `reasoning_effort`. DeepSeek accepts only `low`, `high`, and `max`; `medium`
+/// maps to `high`, and `off` is unsupported via `reasoning_effort` (disabling
+/// thinking requires `thinking: {type: disabled}`), so it emits nothing.
+pub fn deepseek_reasoning_effort_for_thinking(
+    _model_name: &str,
+    effort: ThinkingEffort,
+) -> Option<String> {
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some("low".to_string()),
+        ThinkingEffort::Medium | ThinkingEffort::High => Some("high".to_string()),
+        ThinkingEffort::Max => Some("max".to_string()),
+    }
 }
 
 /// Maps Goose's effort levels to values accepted by xAI Chat Completions.
@@ -4715,7 +4771,10 @@ data: [DONE]"#;
         assert_eq!(spec.len(), 2);
         assert_eq!(spec[0]["role"], "user");
         assert_eq!(spec[1]["role"], "assistant");
-        assert!(spec[1].get("reasoning_content").is_none());
+        // Stale reasoning must not leak across the user message; an empty
+        // reasoning_content is emitted (not the stale value) so DeepSeek's
+        // thinking-mode requirement is satisfied.
+        assert_eq!(spec[1]["reasoning_content"], "");
 
         Ok(())
     }
@@ -4868,11 +4927,12 @@ data: [DONE]"#;
             "sequential tool calls must not be merged"
         );
 
-        // Turn 1 carries reasoning; turn 2 must not inherit it.
+        // Turn 1 carries reasoning; turn 2 must not inherit it, but still
+        // carries an empty reasoning_content so DeepSeek's thinking-mode
+        // requirement is satisfied without leaking the stale value.
         assert_eq!(assistant_msgs[0]["reasoning_content"], "turn1_reasoning");
-        assert!(
-            assistant_msgs[1].get("reasoning_content").is_none()
-                || assistant_msgs[1]["reasoning_content"].is_null(),
+        assert_eq!(
+            assistant_msgs[1]["reasoning_content"], "",
             "turn 2 must not inherit stale reasoning from turn 1"
         );
 
