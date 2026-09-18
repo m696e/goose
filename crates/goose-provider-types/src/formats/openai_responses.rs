@@ -3391,3 +3391,25 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod responses_compat_tests {
+    use super::*;
+
+    /// OpenRouter's Responses implementation omits both `created_at` and
+    /// `sequence_number`; neither is read, so parsing must not fail.
+    #[test]
+    fn response_created_without_created_at_or_sequence_number() {
+        let data = r#"{"type":"response.created","response":{"id":"gen-1","object":"response","status":"in_progress","model":"gpt-5.6-sol"}}"#;
+
+        let event: ResponsesStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            ResponsesStreamEvent::ResponseCreated { response, .. } => {
+                assert_eq!(response.model, "gpt-5.6-sol");
+                assert_eq!(response.created_at, 0);
+            }
+            _ => panic!("expected ResponseCreated"),
+        }
+    }
+}
