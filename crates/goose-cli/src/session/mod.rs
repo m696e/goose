@@ -1913,10 +1913,6 @@ impl CliSession {
             .get_param::<bool>("GOOSE_CLI_SHOW_COST")
             .unwrap_or(false);
 
-        let provider_name = config
-            .get_goose_provider()
-            .unwrap_or_else(|_| "unknown".to_string());
-
         match self.get_session().await {
             Ok(metadata) => {
                 let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
@@ -1924,6 +1920,16 @@ impl CliSession {
                 output::display_context_usage(total_tokens, context_limit);
 
                 if show_cost {
+                    // Price the session's own provider/model. The globally active
+                    // provider is only a fallback for sessions whose provider was
+                    // never persisted — pricing a non-default provider's session
+                    // against the default provider's rates misreports the cost.
+                    let provider_name = metadata
+                        .provider_name
+                        .clone()
+                        .or_else(|| config.get_goose_provider().ok())
+                        .unwrap_or_else(|| "unknown".to_string());
+
                     output::display_cost_usage(
                         &provider_name,
                         &model_config.model_name,
