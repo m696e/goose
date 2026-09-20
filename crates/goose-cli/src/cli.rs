@@ -42,7 +42,7 @@ use crate::session::{build_session, SessionBuilderConfig};
 use goose::agents::Container;
 use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 #[cfg(feature = "acp-http")]
 const GOOSE_SERVER_SECRET_KEY_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
@@ -404,6 +404,7 @@ async fn get_or_create_session_id(
     identifier: Option<Identifier>,
     resume: bool,
     no_session: bool,
+    pick_interactively: bool,
     goose_mode: GooseMode,
 ) -> Result<Option<String>> {
     if no_session {
@@ -414,6 +415,15 @@ async fn get_or_create_session_id(
 
     let resolved_id = if resume {
         let Some(id) = identifier else {
+            if pick_interactively && std::io::stdin().is_terminal() {
+                if let Some(session_id) =
+                    crate::commands::session::prompt_interactive_session_resume(&session_manager)
+                        .await?
+                {
+                    return Ok(Some(session_id));
+                }
+            }
+
             let sessions = session_manager
                 .list_sessions_by_types(&[SessionType::User])
                 .await?;
@@ -543,6 +553,33 @@ enum SessionCommand {
 
         #[arg(short = 'l', long = "limit", help = "Limit the number of results")]
         limit: Option<usize>,
+    },
+    #[command(
+        about = "Search sessions by keyword in their message content",
+        long_about = "Search the message content of past sessions. Each whitespace-separated \
+                      word in the query is matched independently, so quoting a phrase matches \
+                      any of its words rather than the phrase itself."
+    )]
+    Search {
+        /// Text to look for in message content
+        #[arg(value_name = "QUERY", num_args = 1.., required = true)]
+        query: Vec<String>,
+
+        #[arg(
+            short,
+            long,
+            help = "Output format (text, json)",
+            default_value = "text"
+        )]
+        format: String,
+
+        #[arg(
+            short = 'l',
+            long = "limit",
+            help = "Maximum number of matching messages to fetch",
+            default_value = "10"
+        )]
+        limit: usize,
     },
     #[command(about = "Remove sessions. Runs interactively if no ID, name, or regex is provided.")]
     Remove {
@@ -1927,6 +1964,13 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
         } => {
             handle_session_list(format, ascending, working_dir, limit).await?;
         }
+        SessionCommand::Search {
+            query,
+            format,
+            limit,
+        } => {
+            crate::commands::session::handle_session_search(query.join(" "), format, limit).await?;
+        }
         SessionCommand::Remove { identifier, regex } => {
             let (session_id, name) = if let Some(id) = identifier {
                 (id.session_id, id.name)
@@ -2064,7 +2108,8 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let mut session_id = get_or_create_session_id(identifier, resume, false, goose_mode).await?;
+    let mut session_id =
+        get_or_create_session_id(identifier, resume, false, true, goose_mode).await?;
 
     if edit || fork {
         if let Some(ref id) = session_id {
@@ -2305,6 +2350,7 @@ async fn handle_run_command(
         identifier,
         run_behavior.resume,
         run_behavior.no_session,
+        false,
         goose_mode,
     )
     .await?;
@@ -2772,7 +2818,7 @@ async fn handle_default_session() -> Result<()> {
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let session_id = get_or_create_session_id(None, false, false, false, goose_mode).await?;
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use cliclack::{confirm, multiselect, select};
+use console::style;
 use etcetera::home_dir;
 use goose::session::{
     export_session_to_html, export_session_to_markdown, generate_diagnostics, DiagnosticsLevel,
@@ -14,6 +15,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const TRUNCATED_DESC_LENGTH: usize = 60;
+const SESSION_PICKER_ROWS: usize = 10;
+const SEARCH_SNIPPET_LENGTH: usize = 120;
 
 fn display_path_with_tilde(path: &Path) -> String {
     #[cfg(not(target_os = "windows"))]
@@ -265,6 +268,221 @@ pub async fn handle_session_list(
     Ok(())
 }
 
+/// Window of `content` around the first match of any query word.
+///
+/// The search returns whole messages, so truncating from the front can hide the
+/// very word that matched. This centres the window on the first hit instead.
+fn matching_snippet(content: &str, query: &str, max_chars: usize) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= max_chars {
+        return flat;
+    }
+
+    let lowered: Vec<char> = flat.to_lowercase().chars().collect();
+    if lowered.len() != chars.len() {
+        return safe_truncate(&flat, max_chars);
+    }
+
+    let hit = query
+        .split_whitespace()
+        .filter_map(|word| {
+            let needle: Vec<char> = word.to_lowercase().chars().collect();
+            if needle.is_empty() || needle.len() > lowered.len() {
+                return None;
+            }
+            lowered
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+        })
+        .min();
+
+    let Some(hit) = hit else {
+        return safe_truncate(&flat, max_chars);
+    };
+
+    let start = hit.saturating_sub(max_chars / 3);
+    let end = (start + max_chars).min(chars.len());
+
+    format!(
+        "{}{}{}",
+        if start > 0 { "..." } else { "" },
+        chars[start..end].iter().collect::<String>(),
+        if end < chars.len() { "..." } else { "" }
+    )
+}
+
+/// Wrap every occurrence of a query word in `text` with `style_match`.
+///
+/// Matching is case-insensitive, as in the search itself. `text` comes from
+/// [`matching_snippet`], so it already contains at least one hit.
+fn highlight_matches(text: &str, query: &str, style_match: impl Fn(&str) -> String) -> String {
+    let needles: Vec<Vec<char>> = query
+        .split_whitespace()
+        .map(|word| word.to_lowercase().chars().collect())
+        .filter(|needle: &Vec<char>| !needle.is_empty())
+        .collect();
+
+    let chars: Vec<char> = text.chars().collect();
+    let lowered: Vec<char> = text.to_lowercase().chars().collect();
+    if needles.is_empty() || lowered.len() != chars.len() {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let matched = needles.iter().find_map(|needle| {
+            lowered[index..]
+                .starts_with(needle.as_slice())
+                .then_some(needle.len())
+        });
+
+        match matched {
+            Some(len) => {
+                let hit: String = chars[index..index + len].iter().collect();
+                out.push_str(&style_match(&hit));
+                index += len;
+            }
+            None => {
+                out.push(chars[index]);
+                index += 1;
+            }
+        }
+    }
+
+    out
+}
+
+pub async fn handle_session_search(query: String, format: String, limit: usize) -> Result<()> {
+    let session_manager = SessionManager::instance();
+    let results = session_manager
+        .search_chat_history(
+            &query,
+            Some(limit),
+            None,
+            None,
+            None,
+            vec![SessionType::User, SessionType::Scheduled],
+        )
+        .await?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    if format == "json" {
+        let payload = serde_json::to_string(&results)?;
+        write_line_or_broken_pipe_ok(&mut out, &payload)?;
+        return Ok(());
+    }
+
+    if results.total_matches == 0 {
+        write_line_or_broken_pipe_ok(&mut out, &format!("No sessions match \"{query}\""))?;
+        return Ok(());
+    }
+
+    let summary = format!(
+        "{} matching message(s) across {} session(s) for \"{}\":",
+        results.total_matches,
+        results.results.len(),
+        query
+    );
+    if !write_line_or_broken_pipe_ok(&mut out, &style(summary).bold().to_string())? {
+        return Ok(());
+    }
+
+    for result in &results.results {
+        let description = if result.session_description.is_empty() {
+            "(unnamed)".to_string()
+        } else {
+            result.session_description.clone()
+        };
+
+        let header = format!(
+            "{} - {} - {} - {}",
+            style(&result.session_id).cyan(),
+            style(description).bold(),
+            style(result.last_activity).dim(),
+            style(display_path_with_tilde(Path::new(
+                &result.session_working_dir
+            )))
+            .dim(),
+        );
+        if !write_line_or_broken_pipe_ok(&mut out, &header)? {
+            return Ok(());
+        }
+
+        for message in &result.messages {
+            let role = style(format!("[{}]", message.role)).dim();
+            let snippet = matching_snippet(&message.content, &query, SEARCH_SNIPPET_LENGTH);
+            let snippet = highlight_matches(&snippet, &query, |hit| {
+                style(hit).yellow().bold().to_string()
+            });
+
+            let line = format!("    {role} {snippet}");
+            if !write_line_or_broken_pipe_ok(&mut out, &line)? {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_search_tests {
+    use super::*;
+
+    #[test]
+    fn short_content_is_flattened_not_elided() {
+        let snippet = matching_snippet("line one\n\n   line two", "two", 120);
+
+        assert_eq!(snippet, "line one line two");
+    }
+
+    #[test]
+    fn long_content_keeps_the_match_visible() {
+        let content = format!("{} NEEDLE {}", "filler ".repeat(40), "tail ".repeat(40));
+
+        let snippet = matching_snippet(&content, "needle", 60);
+
+        assert!(snippet.contains("NEEDLE"), "{snippet}");
+        assert!(snippet.starts_with("..."), "{snippet}");
+        assert!(snippet.ends_with("..."), "{snippet}");
+    }
+
+    #[test]
+    fn unmatched_long_content_falls_back_to_the_front() {
+        let content = "word ".repeat(200);
+
+        let snippet = matching_snippet(&content, "absent", 40);
+
+        assert!(snippet.starts_with("word"), "{snippet}");
+        assert!(snippet.ends_with("..."), "{snippet}");
+    }
+
+    #[test]
+    fn highlight_wraps_every_match_case_insensitively() {
+        let styled = highlight_matches("Tor over SSH, tor again", "tor", |m| format!("<{m}>"));
+
+        assert_eq!(styled, "<Tor> over SSH, <tor> again");
+    }
+
+    #[test]
+    fn highlight_covers_every_query_word() {
+        let styled = highlight_matches("alpha then beta", "beta alpha", |m| format!("[{m}]"));
+
+        assert_eq!(styled, "[alpha] then [beta]");
+    }
+
+    #[test]
+    fn highlight_is_a_noop_without_query_words() {
+        let styled = highlight_matches("nothing here", "   ", |m| format!("<{m}>"));
+
+        assert_eq!(styled, "nothing here");
+    }
+}
+
 #[cfg(test)]
 mod session_list_tests {
     use super::*;
@@ -488,6 +706,93 @@ pub async fn prompt_interactive_session_selection(
         Ok(session.id.clone())
     } else {
         Err(anyhow::anyhow!("Invalid selection"))
+    }
+}
+
+/// Display text for a session in the resume picker.
+///
+/// cliclack's filter mode scores this string (Jaro-Winkler over the lowercased
+/// label, plus a bonus when every typed word appears in it), so the label carries
+/// the fields a user is likely to type. The name leads to earn the prefix bonus.
+///
+/// The last-message snippet is deliberately absent: it is only hydrated for the
+/// ACP list path, so it is always `None` on this one.
+fn session_picker_label(session: &Session) -> String {
+    let name = if session.name.is_empty() {
+        "(unnamed)"
+    } else {
+        session.name.as_str()
+    };
+
+    format!(
+        "{} - {} - {} - {}",
+        safe_truncate(name, TRUNCATED_DESC_LENGTH),
+        session.id,
+        session_activity_at(session),
+        safe_truncate(
+            &display_path_with_tilde(&session.working_dir),
+            TRUNCATED_DESC_LENGTH
+        ),
+    )
+}
+
+/// Pick a session to resume from a list that narrows as the user types.
+///
+/// The most recently used session is pre-selected, so pressing Enter reproduces
+/// the non-interactive "resume the last session" behaviour. Returns `Ok(None)`
+/// when there is no user session to offer; what that means is the caller's call.
+pub async fn prompt_interactive_session_resume(
+    session_manager: &SessionManager,
+) -> Result<Option<String>> {
+    let sessions = session_manager
+        .list_sessions_by_types(&[SessionType::User])
+        .await?;
+
+    let Some(most_recent) = sessions.first() else {
+        return Ok(None);
+    };
+
+    let mut selector = select("Select a session to resume (type to filter):")
+        .filter_mode()
+        .max_rows(SESSION_PICKER_ROWS)
+        .initial_value(most_recent.id.clone());
+
+    for session in &sessions {
+        selector = selector.item(session.id.clone(), session_picker_label(session), "");
+    }
+
+    Ok(Some(selector.interact()?))
+}
+
+#[cfg(test)]
+mod session_picker_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn session(name: &str, dir: &str) -> Session {
+        Session {
+            id: "20260101_120000".to_string(),
+            working_dir: PathBuf::from(dir),
+            name: name.to_string(),
+            updated_at: Utc::now(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn label_carries_every_field_a_user_might_type() {
+        let label = session_picker_label(&session("project-x", "/home/min/work/api"));
+
+        assert!(label.contains("project-x"), "{label}");
+        assert!(label.contains("20260101_120000"), "{label}");
+        assert!(label.contains("work/api"), "{label}");
+    }
+
+    #[test]
+    fn label_marks_unnamed_sessions() {
+        let label = session_picker_label(&session("", "/tmp"));
+
+        assert!(label.contains("(unnamed)"), "{label}");
     }
 }
 
