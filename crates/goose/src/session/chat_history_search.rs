@@ -135,7 +135,7 @@ impl<'a> ChatHistorySearch<'a> {
             r#"
             SELECT 
                 s.id as session_id,
-                s.description as session_description,
+                COALESCE(NULLIF(s.name, ''), s.description) as session_description,
                 s.working_dir as session_working_dir,
                 s.created_at as session_created_at,
                 m.role,
@@ -391,6 +391,7 @@ mod tests {
             r#"
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL,
                 working_dir TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL,
