@@ -167,6 +167,56 @@ cargo fmt   # format code
 cargo clippy --all-targets -- -D warnings # run the linter
 ```
 
+### Build performance
+
+Release rebuilds of the CLI are **codegen-bound, not link-bound**. A cold relink
+spends ~45s in rustc's LLVM phase and only ~1s in the linker, so swapping the
+linker (`mold`, `lld`) saves well under a second. What actually costs time is
+rebuilding code that did not change. Steady-state measurements on a 16-core host
+(goose 1.50.0), applying a real one-line edit (identical with or without hermit):
+
+- cold relink of the CLI: ~48s, of which ~1s is the linker
+- `goose-cli` lib, `CARGO_INCREMENTAL=1`: ~7s (1 crate); without it ~32s (10 crates)
+- `goose` core lib, `CARGO_INCREMENTAL=1`: ~13s (2 crates)
+- binary only (`main.rs`), `CARGO_INCREMENTAL=1`: ~5s
+- no-op build in a stable environment: ~0.7s
+
+So for the inner loop keep incremental release builds going:
+
+```
+just cli-iter   # release + incremental, prints the artifact path and hash
+```
+
+That leaves the binary at `target/release/goose`. If you run `goose` from your
+`PATH`, remember that is a *different* file until you install it, so it is easy to
+test a stale binary and conclude a change did not work:
+
+```
+just install-cli   # build and install to ~/.local/bin (override GOOSE_INSTALL_DIR)
+```
+
+Incremental builds add ~3.5 GiB to `target/release/incremental` and make the
+first build slower. Use a plain `cargo build --release` (or `just release-binary`)
+for artifacts you intend to ship or benchmark, since incremental codegen is not
+intended for release artifacts.
+
+Two known traps make a rebuild pull in 10 crates instead of 1, so avoid them:
+
+- **Do not mix hermit and non-hermit shells.** Hermit relocates `CARGO_HOME` to
+  `.hermit/rust`, which changes registry paths baked into build-script
+  fingerprints, so every switch costs a full rebuild. Measured with no source
+  change at all: 974 crates, 8m06s.
+- `llama-cpp-sys-2` declares `rerun-if-changed` on an absolute registry path
+  (`<CARGO_HOME>/registry/src/.../llama.cpp/CMakeLists.txt`). When that rule
+  fires, the rebuild cascades through `goose-local-inference` -> `goose-providers`
+  -> `goose` -> `goose-cli`.
+
+A faster linker is still worth having for debug builds, where the ~890 MiB debug
+binary spends ~3s of a ~5s relink inside the linker. Install `mold` and build with
+`RUSTFLAGS="-C link-arg=-fuse-ld=mold"`. It is deliberately not enabled in
+`.cargo/config.toml`, because that would break builds for contributors who do not
+have `mold` installed.
+
 ### Node
 
 To run the app:

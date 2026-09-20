@@ -26,6 +26,45 @@ release-binary:
     cargo build --release -p goose-cli --bin goose
     @just copy-binary
 
+# Build the CLI for fast local iteration (release + incremental compilation).
+#
+# Release rebuilds are codegen-bound, not link-bound: a cold relink spends ~45s in
+# rustc's LLVM phase and ~1s in the linker, so a faster linker buys almost nothing
+# here. Reusing codegen for unchanged code is what helps. Steady-state times on a
+# 16-core host (goose 1.50.0), applying a real one-line edit:
+#
+#   goose-cli lib       ~7s with this recipe   (~32s without incremental)
+#   goose core lib     ~13s
+#   binary only         ~5s
+#
+# The binary still lands at target/release/goose. Use `just release-binary` (no
+# incremental) for artifacts you intend to ship or benchmark, and see the
+# "Build performance" section of CONTRIBUTING.md for the traps that make a
+# rebuild pull in 10 crates instead of 1.
+cli-iter:
+    @echo "Building CLI (release + incremental, for iteration)..."
+    CARGO_INCREMENTAL=1 cargo build --release -p goose-cli --bin goose
+    @echo ""
+    @ls -l --time-style=long-iso target/release/goose
+    @sha256sum target/release/goose
+    @echo "Run: ./target/release/goose"
+
+# Build the CLI and install it as `goose`, so `goose` in your PATH is always the
+# build you just made. Overwrite `GOOSE_INSTALL_DIR` to install elsewhere.
+#
+# Installing under a temporary name and then renaming means an in-place overwrite
+# of a running executable can never happen (`ETXTBSY`), and the destination is
+# never left half-written. Hashes are printed so you can confirm the file in your
+# PATH matches the artifact you built.
+install-cli:
+    @echo "Building CLI (release + incremental)..."
+    CARGO_INCREMENTAL=1 cargo build --release -p goose-cli --bin goose
+    @install -m755 target/release/goose "${GOOSE_INSTALL_DIR:-$HOME/.local/bin}/.goose.new"
+    @mv -f "${GOOSE_INSTALL_DIR:-$HOME/.local/bin}/.goose.new" "${GOOSE_INSTALL_DIR:-$HOME/.local/bin}/goose"
+    @echo ""
+    @sha256sum target/release/goose "${GOOSE_INSTALL_DIR:-$HOME/.local/bin}/goose"
+    @echo "Installed to ${GOOSE_INSTALL_DIR:-$HOME/.local/bin}/goose — the two hashes must match."
+
 # Build Windows executable on a Windows host
 [unix]
 release-windows:
