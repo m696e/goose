@@ -41,12 +41,37 @@ pub fn materialize_model_config(provider_name: &str, model: ModelConfig) -> Resu
 
 fn apply_canonical_limits(provider_name: &str, model: ModelConfig) -> ModelConfig {
     if provider_name == goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
-        model
-    } else {
+        return model;
+    }
+    with_declarative_vision(
+        provider_name,
         model
             .with_canonical_limits(provider_name)
-            .with_canonical_vision_support(provider_name)
+            .with_canonical_vision_support(provider_name),
+    )
+}
+
+/// Declarative and custom providers may serve models the canonical registry
+/// does not know, which leaves `supports_vision` unset. Formatters read unset
+/// as "no vision" and drop image content, so fall back to the provider's own
+/// declared model list when the model states a value there.
+fn with_declarative_vision(provider_name: &str, mut model: ModelConfig) -> ModelConfig {
+    if model.supports_vision.is_none() {
+        if let Some(supports_vision) = declared_supports_vision(provider_name, &model.model_name) {
+            model = model.with_vision_support(supports_vision);
+        }
     }
+    model
+}
+
+fn declared_supports_vision(provider_name: &str, model_name: &str) -> Option<bool> {
+    crate::config::declarative_providers::load_provider(provider_name)
+        .ok()?
+        .config
+        .models
+        .iter()
+        .find(|model| model.name == model_name)?
+        .supports_vision
 }
 
 fn materialize_model_config_inner(
@@ -230,6 +255,76 @@ fn parse_yaml_bool_config(key: &str, value: serde_yaml::Value) -> Result<bool> {
             serde_yaml::to_string(&other).unwrap_or_else(|_| "<unprintable>".to_string()).trim()
         ))
         }
+    }
+}
+
+#[cfg(test)]
+mod declarative_vision_tests {
+    use super::*;
+    use crate::config::declarative_providers::{
+        create_custom_provider, CreateCustomProviderParams,
+    };
+    use goose_providers::base::ModelInfo;
+
+    fn create_provider_with_model(model: ModelInfo) -> String {
+        create_custom_provider(CreateCustomProviderParams {
+            engine: "openai".to_string(),
+            display_name: "Vision Probe".to_string(),
+            api_url: "https://example.invalid/v1".to_string(),
+            api_key: None,
+            models: vec![model],
+            supports_streaming: Some(true),
+            headers: None,
+            requires_auth: false,
+            catalog_provider_id: None,
+            base_path: None,
+            toolshim: false,
+            preserves_thinking: None,
+            auth: None,
+        })
+        .unwrap()
+        .name
+    }
+
+    #[test]
+    fn fills_vision_from_declarative_model_when_registry_has_no_entry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(
+            ModelInfo::new("unknown-vision-model").with_vision_support(true),
+        );
+
+        let config = model_config_from_user_config(&provider, "unknown-vision-model").unwrap();
+        assert_eq!(config.supports_vision, Some(true));
+    }
+
+    #[test]
+    fn declarative_vision_false_is_honored() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(
+            ModelInfo::new("unknown-text-model").with_vision_support(false),
+        );
+
+        let config = model_config_from_user_config(&provider, "unknown-text-model").unwrap();
+        assert_eq!(config.supports_vision, Some(false));
+    }
+
+    #[test]
+    fn undeclared_vision_stays_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider =
+            create_provider_with_model(ModelInfo::new("unknown-plain-model").with_context_limit(1));
+
+        let config = model_config_from_user_config(&provider, "unknown-plain-model").unwrap();
+        assert_eq!(config.supports_vision, None);
     }
 }
 

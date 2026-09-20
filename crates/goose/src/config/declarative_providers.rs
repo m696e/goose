@@ -307,6 +307,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
                     model.supports_cache_control = model
                         .supports_cache_control
                         .or(existing.supports_cache_control);
+                    model.supports_vision = model.supports_vision.or(existing.supports_vision);
                     model.reasoning |= existing.reasoning;
                     model.thinking_preservation_format = model
                         .thinking_preservation_format
@@ -610,6 +611,7 @@ mod tests {
                 output_token_cost: None,
                 currency: None,
                 supports_cache_control: None,
+                supports_vision: None,
                 reasoning: false,
                 thinking_preservation_format: None,
                 request_params: None,

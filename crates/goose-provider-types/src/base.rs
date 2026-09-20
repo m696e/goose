@@ -263,6 +263,10 @@ pub struct ModelInfo {
     pub currency: Option<String>,
     /// Whether this model supports cache control
     pub supports_cache_control: Option<bool>,
+    /// Whether this model accepts image input (vision). `None` means unknown;
+    /// callers should fall back to canonical metadata before assuming no vision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Whether this model supports reasoning/thinking controls
     #[serde(default)]
     pub reasoning: bool,
@@ -283,6 +287,7 @@ impl ModelInfo {
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            supports_vision: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -314,10 +319,16 @@ impl ModelInfo {
             output_token_cost: Some(output_cost),
             currency: Some("$".to_string()),
             supports_cache_control: None,
+            supports_vision: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
         }
+    }
+
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = Some(supports_vision);
+        self
     }
 }
 
@@ -364,6 +375,12 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
         output_token_cost: None,
         currency: None,
         supports_cache_control: None,
+        supports_vision: canonical.as_ref().map(|model| {
+            model
+                .modalities
+                .input
+                .contains(&crate::canonical::Modality::Image)
+        }),
         reasoning,
         thinking_preservation_format: None,
         request_params: None,
@@ -1101,6 +1118,7 @@ mod tests {
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            supports_vision: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -1116,6 +1134,7 @@ mod tests {
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            supports_vision: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -1131,6 +1150,7 @@ mod tests {
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            supports_vision: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -1163,6 +1183,29 @@ mod tests {
             serde_json::from_str(r#"{"name": "gpt-4o", "context_limit": 128000}"#).unwrap();
         assert_eq!(bare.thinking_preservation_format, None);
         assert_eq!(bare.request_params, None);
+    }
+
+    #[test]
+    fn test_model_info_supports_vision_round_trip() {
+        let info = ModelInfo::new("vision-model").with_vision_support(true);
+        let serialized = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            serialized.get("supports_vision"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let parsed: ModelInfo = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed.supports_vision, Some(true));
+
+        let absent = ModelInfo::new("plain-model");
+        let serialized = serde_json::to_value(&absent).unwrap();
+        assert!(serialized.get("supports_vision").is_none());
+        assert_eq!(
+            serde_json::from_str::<ModelInfo>(r#"{"name": "plain-model"}"#)
+                .unwrap()
+                .supports_vision,
+            None
+        );
     }
 
     #[test]
