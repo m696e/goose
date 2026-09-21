@@ -38,3 +38,4 @@ pub mod typesafe;
 pub use declarative::declarative_providers::*;
 
 pub mod snowflake;
+pub mod stream_util;

@@ -588,33 +588,23 @@ fn with_line_timeout(
     stream: impl futures::Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
     timeout_secs: u64,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>> {
-    let timeout = Duration::from_secs(timeout_secs);
-    Box::pin(try_stream! {
-        let mut stream = stream;
-
-        // Allow time-to-first-token to be governed by the request timeout.
-        // Only enforce per-chunk timeout after first SSE line arrives.
-        match stream.next().await {
-            Some(first_item) => yield first_item?,
-            None => return,
-        }
-        loop {
-            match tokio::time::timeout(timeout, stream.next()).await {
-                Ok(Some(item)) => yield item?,
-                Ok(None) => break,
-                Err(_) => {
-                    Err::<(), anyhow::Error>(anyhow::anyhow!(
-                        "Ollama stream stalled: no data received for {}s. \
-                         This may indicate the model is overwhelmed by the request payload. \
-                         Try a smaller model, reduce the number of tools, or increase the \
-                         timeout via OLLAMA_STREAM_TIMEOUT, GOOSE_STREAM_TIMEOUT, or \
-                         OLLAMA_TIMEOUT in your config.",
-                        timeout_secs
-                    ))?;
-                }
-            }
-        }
-    })
+    // Time-to-first-token is governed by the request timeout: loading a model into
+    // memory can take minutes, so the first line is exempt from the idle timeout.
+    crate::stream_util::with_line_timeout(
+        stream,
+        Duration::from_secs(timeout_secs),
+        true,
+        move || {
+            anyhow::anyhow!(
+                "Ollama stream stalled: no data received for {}s. \
+                 This may indicate the model is overwhelmed by the request payload. \
+                 Try a smaller model, reduce the number of tools, or increase the \
+                 timeout via OLLAMA_STREAM_TIMEOUT, GOOSE_STREAM_TIMEOUT, or \
+                 OLLAMA_TIMEOUT in your config.",
+                timeout_secs
+            )
+        },
+    )
 }
 
 /// Ollama-specific streaming handler with XML tool call fallback.

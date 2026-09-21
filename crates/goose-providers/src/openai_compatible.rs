@@ -11,7 +11,6 @@ use reqwest::Response;
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::pin;
-use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -26,6 +25,7 @@ use crate::formats::openai::{
     record_response_metadata, response_to_message, response_to_streaming_message,
     OpenAiFormatOptions,
 };
+use crate::stream_util::with_line_timeout;
 
 const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
 
@@ -35,6 +35,13 @@ fn chunk_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// Error raised when the provider sends no data for [`chunk_timeout`].
+fn chunk_timeout_error() -> ProviderError {
+    ProviderError::NetworkError(
+        "Stream timed out waiting for next chunk — check your network connection".to_string(),
+    )
 }
 use crate::formats::openai_responses::responses_api_to_streaming_message;
 use crate::model::ModelConfig;
@@ -258,13 +265,19 @@ pub fn stream_openai_compat(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let message_stream = response_to_streaming_message(framed);
+        // Enforce the idle timeout on the raw SSE lines, not on the assembled
+        // messages: the decoder buffers tool-call arguments and emits the call as
+        // a single item, so a slow (but healthy) tool call used to be reported as
+        // a network error. See `stream_util::with_line_timeout`.
+        let timed_lines = with_line_timeout(
+            framed,
+            chunk_timeout(),
+            false,
+            || chunk_timeout_error().into(),
+        );
+        let message_stream = response_to_streaming_message(timed_lines);
         pin!(message_stream);
-        while let Some(message) = timeout(chunk_timeout(), message_stream.next()).await.map_err(|_| {
-            ProviderError::NetworkError(
-                "Stream timed out waiting for next chunk — check your network connection".to_string()
-            )
-        })? {
+        while let Some(message) = message_stream.next().await {
             let (message, usage) = message.map_err(|e|
                 e.downcast::<ProviderError>()
                     .unwrap_or_else(ProviderError::stream_decode_error)
@@ -286,13 +299,16 @@ pub fn stream_responses_compat(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let message_stream = responses_api_to_streaming_message(framed);
+        // Raw-line idle timeout — see `stream_openai_compat` above.
+        let timed_lines = with_line_timeout(
+            framed,
+            chunk_timeout(),
+            false,
+            || chunk_timeout_error().into(),
+        );
+        let message_stream = responses_api_to_streaming_message(timed_lines);
         pin!(message_stream);
-        while let Some(message) = timeout(chunk_timeout(), message_stream.next()).await.map_err(|_| {
-            ProviderError::NetworkError(
-                "Stream timed out waiting for next chunk — check your network connection".to_string()
-            )
-        })? {
+        while let Some(message) = message_stream.next().await {
             let (message, usage) = message.map_err(|e|
                 e.downcast::<ProviderError>()
                     .unwrap_or_else(ProviderError::stream_decode_error)

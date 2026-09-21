@@ -3,6 +3,7 @@ use crate::base::ProviderDescriptor;
 use crate::declarative::{DeclarativeProviderConfig, KeyResolver};
 use crate::errors::ProviderError;
 use crate::request_log::{start_log, LoggerHandleExt};
+use crate::stream_util::with_line_timeout;
 use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -13,7 +14,6 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 use tokio::pin;
-use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
@@ -36,6 +36,13 @@ fn chunk_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// Error raised when the provider sends no data for [`chunk_timeout`].
+fn chunk_timeout_error() -> ProviderError {
+    ProviderError::NetworkError(
+        "Stream timed out waiting for next chunk — check your network connection".to_string(),
+    )
 }
 
 use crate::conversation::message::Message;
@@ -258,13 +265,13 @@ impl AnthropicProvider {
         Ok(Box::pin(try_stream! {
             let reader = StreamReader::new(stream);
             let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
-            let messages = response_to_streaming_message(framed);
+            // Enforce the idle timeout on the raw SSE lines, not on the assembled
+            // messages: tool-call arguments are buffered and emitted as one item, so
+            // a slow (but healthy) tool call used to be reported as a network error.
+            let timed_lines = with_line_timeout(framed, chunk_timeout(), false, || chunk_timeout_error().into());
+            let messages = response_to_streaming_message(timed_lines);
             pin!(messages);
-            while let Some(message) = timeout(chunk_timeout(), futures::StreamExt::next(&mut messages)).await.map_err(|_| {
-                ProviderError::NetworkError(
-                    "Stream timed out waiting for next chunk — check your network connection".to_string()
-                )
-            })? {
+            while let Some(message) = futures::StreamExt::next(&mut messages).await {
                 let (message, usage) = message.map_err(ProviderError::from_stream_error)?;
                 if let Some(transformations) = usage
                     .as_ref()
