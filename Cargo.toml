@@ -117,6 +117,12 @@ icu_locale = { version = "=2.1.1", default-features = false }
 [patch.crates-io]
 v8 = { path = "vendor/v8" }
 sys-info = { path = "vendor/sys-info" }
+# pctx_config is pulled in by the `code-mode` feature. Upstream it asks for
+# reqwest/rustls, which is the only path that pulls rustls + hyper-rustls +
+# aws-lc-rs into the graph — a second TLS stack alongside the OpenSSL one that
+# `native-tls` selects. The vendored copy differs by exactly one feature name
+# in its Cargo.toml; see vendor/pctx_config/Cargo.toml.
+pctx_config = { path = "vendor/pctx_config" }
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
 
 # Dependencies don't need debug info. You rarely step-debug into third-party

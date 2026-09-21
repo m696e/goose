@@ -8684,8 +8684,6 @@ dependencies = [
 [[package]]
 name = "pctx_config"
 version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89eac48aabd3fdd2ed13839c006aff8be43f5ba70858378162551414103199d"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
