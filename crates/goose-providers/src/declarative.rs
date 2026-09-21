@@ -1,11 +1,13 @@
 #[macro_use]
 mod macros;
 
-use std::{collections::HashMap, path::Path, str::FromStr};
+use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
 
 use anyhow::Result;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::stream_util::StreamTimeouts;
 
 pub static FIXED_PROVIDERS: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/declarative/definitions");
 
@@ -161,6 +163,15 @@ pub struct DeclarativeProviderConfig {
     #[serde(default)]
     pub session_id_header_override: Option<String>,
     pub timeout_seconds: Option<u64>,
+    /// Overrides the inter-chunk idle window (seconds) applied to streaming
+    /// responses. Defaults to `GOOSE_INFERENCE_CHUNK_TIMEOUT_SECS` / 15s.
+    pub stream_chunk_timeout_secs: Option<u64>,
+    /// Overrides the time-to-first-line budget (seconds) applied to streaming
+    /// responses. Prefill grows with context size, so a provider serving very
+    /// large contexts can need far more than the 15s inter-chunk window before
+    /// its first byte arrives. Defaults to
+    /// `GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS` / 120s.
+    pub stream_first_line_timeout_secs: Option<u64>,
     pub supports_streaming: Option<bool>,
     #[serde(default = "default_requires_auth")]
     pub requires_auth: bool,
@@ -205,6 +216,24 @@ fn default_requires_auth() -> bool {
 
 pub fn should_preserve_thinking_by_default(engine: &ProviderEngine) -> bool {
     matches!(engine, ProviderEngine::OpenAI)
+}
+
+impl DeclarativeProviderConfig {
+    /// The streaming idle budgets this provider should use: its own overrides
+    /// where set, otherwise the `GOOSE_INFERENCE_*_TIMEOUT_SECS` defaults.
+    pub fn stream_timeouts(&self) -> StreamTimeouts {
+        let defaults = StreamTimeouts::default();
+        StreamTimeouts {
+            chunk: self
+                .stream_chunk_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.chunk),
+            first_line: self
+                .stream_first_line_timeout_secs
+                .map(Duration::from_secs)
+                .or(defaults.first_line),
+        }
+    }
 }
 
 /// Deserialize an optional string, treating empty/whitespace-only values as None.
@@ -420,6 +449,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(ollama.engine, ProviderEngine::Ollama);
+    }
+
+    fn minimal_config_json() -> serde_json::Value {
+        json!({
+            "name": "test-openai",
+            "engine": "openai_compatible",
+            "display_name": "Test OpenAI",
+            "base_url": "http://localhost:1234",
+            "models": [model_json()]
+        })
+    }
+
+    #[test]
+    fn stream_timeouts_default_when_provider_does_not_override_them() {
+        let config: DeclarativeProviderConfig =
+            serde_json::from_value(minimal_config_json()).unwrap();
+
+        // Configs written before these keys existed must keep loading, and fall
+        // back to the global (env-overridable) defaults.
+        assert_eq!(config.stream_chunk_timeout_secs, None);
+        assert_eq!(config.stream_first_line_timeout_secs, None);
+        assert_eq!(config.stream_timeouts(), StreamTimeouts::default());
+    }
+
+    #[test]
+    fn stream_timeouts_honour_provider_overrides() {
+        // A provider serving very large contexts can legitimately need a longer
+        // first-line budget than the global default.
+        let mut definition = minimal_config_json();
+        definition["stream_chunk_timeout_secs"] = json!(3);
+        definition["stream_first_line_timeout_secs"] = json!(600);
+
+        let config: DeclarativeProviderConfig = serde_json::from_value(definition).unwrap();
+        let timeouts = config.stream_timeouts();
+
+        assert_eq!(timeouts.chunk, Duration::from_secs(3));
+        assert_eq!(timeouts.first_line, Some(Duration::from_secs(600)));
     }
 
     #[test]

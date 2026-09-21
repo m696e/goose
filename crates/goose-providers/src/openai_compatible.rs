@@ -1,14 +1,24 @@
-use std::time::Duration;
-
+use crate::conversation::message::Message;
 use crate::conversation::token_usage::{CostSource, ProviderUsage};
+use crate::errors::ProviderError;
+use crate::formats::openai::{
+    create_request, create_request_for_model_with_options, get_cost, get_usage,
+    record_response_metadata, response_to_message, response_to_streaming_message,
+    OpenAiFormatOptions,
+};
+use crate::formats::openai_responses::responses_api_to_streaming_message;
 use crate::http_status::read_json_response;
 use crate::images::ImageFormat;
+use crate::model::ModelConfig;
+use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
+use crate::stream_util::{with_line_timeout, StreamTimeouts, TimeoutPhase};
 use anyhow::Error;
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use reqwest::Response;
 #[cfg(test)]
 use reqwest::StatusCode;
+use rmcp::model::Tool;
 use serde_json::Value;
 use tokio::pin;
 use tokio_stream::StreamExt;
@@ -18,35 +28,32 @@ use tokio_util::io::StreamReader;
 use super::api_client::ApiClient;
 use super::base::{stream_from_single_message, MessageStream, Provider};
 use super::retry::ProviderRetry;
-use crate::conversation::message::Message;
-use crate::errors::ProviderError;
-use crate::formats::openai::{
-    create_request, create_request_for_model_with_options, get_cost, get_usage,
-    record_response_metadata, response_to_message, response_to_streaming_message,
-    OpenAiFormatOptions,
-};
-use crate::stream_util::with_line_timeout;
 
-const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
-
-fn chunk_timeout() -> Duration {
-    let secs = std::env::var("GOOSE_INFERENCE_CHUNK_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+/// Error raised when a provider stream stalls.
+///
+/// The phase separates the two budgets: a gap after the stream has started means
+/// the connection died, whereas a missing *first* line usually means the provider
+/// is still chewing on the prompt (prefill scales with context size), so that
+/// case says so instead of blaming the network.
+pub(crate) fn stream_timeout_error(
+    phase: TimeoutPhase,
+    timeouts: &StreamTimeouts,
+) -> ProviderError {
+    match phase {
+        TimeoutPhase::Idle => ProviderError::NetworkError(
+            "Stream timed out waiting for next chunk — check your network connection".to_string(),
+        ),
+        TimeoutPhase::FirstLine => ProviderError::NetworkError(format!(
+            "The provider sent no response within {}s — it may still be processing the prompt \
+             (large context / slow prefill). Raise `stream_first_line_timeout_secs` for this \
+             provider, or GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS, if that is expected.",
+            timeouts
+                .first_line
+                .map(|budget| budget.as_secs())
+                .unwrap_or_default()
+        )),
+    }
 }
-
-/// Error raised when the provider sends no data for [`chunk_timeout`].
-fn chunk_timeout_error() -> ProviderError {
-    ProviderError::NetworkError(
-        "Stream timed out waiting for next chunk — check your network connection".to_string(),
-    )
-}
-use crate::formats::openai_responses::responses_api_to_streaming_message;
-use crate::model::ModelConfig;
-use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
-use rmcp::model::Tool;
 
 pub struct OpenAiCompatibleProvider {
     name: String,
@@ -55,6 +62,8 @@ pub struct OpenAiCompatibleProvider {
     /// Path prefix prepended to `chat/completions` (e.g. `"deployments/{name}/"` for Azure).
     completions_prefix: String,
     supports_streaming: bool,
+    /// Idle budgets for the SSE line stream; overridable per provider.
+    stream_timeouts: StreamTimeouts,
 }
 
 impl OpenAiCompatibleProvider {
@@ -64,11 +73,17 @@ impl OpenAiCompatibleProvider {
             api_client,
             completions_prefix,
             supports_streaming: true,
+            stream_timeouts: StreamTimeouts::default(),
         }
     }
 
     pub fn with_supports_streaming(mut self, supports_streaming: bool) -> Self {
         self.supports_streaming = supports_streaming;
+        self
+    }
+
+    pub fn with_stream_timeouts(mut self, stream_timeouts: StreamTimeouts) -> Self {
+        self.stream_timeouts = stream_timeouts;
         self
     }
 
@@ -146,7 +161,7 @@ impl OpenAiCompatibleProvider {
                 let _ = log.error(e);
             })?;
         if self.supports_streaming {
-            stream_openai_compat(response, log)
+            stream_openai_compat_with_timeouts(response, log, self.stream_timeouts)
         } else {
             let json = read_json_response(response).await?;
             let message = response_to_message(&json).map_err(|e| {
@@ -256,7 +271,15 @@ pub use super::http_status::handle_response as handle_response_openai_compat;
 
 pub fn stream_openai_compat(
     response: Response,
+    log: Option<Box<dyn RequestLogHandle>>,
+) -> Result<MessageStream, ProviderError> {
+    stream_openai_compat_with_timeouts(response, log, StreamTimeouts::default())
+}
+
+pub fn stream_openai_compat_with_timeouts(
+    response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
+    timeouts: StreamTimeouts,
 ) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -265,15 +288,17 @@ pub fn stream_openai_compat(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        // Enforce the idle timeout on the raw SSE lines, not on the assembled
+        // Enforce the idle timeouts on the raw SSE lines, not on the assembled
         // messages: the decoder buffers tool-call arguments and emits the call as
         // a single item, so a slow (but healthy) tool call used to be reported as
-        // a network error. See `stream_util::with_line_timeout`.
+        // a network error. The first line gets its own, larger budget because it
+        // covers prefill rather than a network gap.
+        // See `stream_util::with_line_timeout`.
         let timed_lines = with_line_timeout(
             framed,
-            chunk_timeout(),
-            false,
-            || chunk_timeout_error().into(),
+            timeouts.chunk,
+            timeouts.first_line,
+            move |phase| stream_timeout_error(phase, &timeouts).into(),
         );
         let message_stream = response_to_streaming_message(timed_lines);
         pin!(message_stream);
@@ -290,7 +315,15 @@ pub fn stream_openai_compat(
 
 pub fn stream_responses_compat(
     response: Response,
+    log: Option<Box<dyn RequestLogHandle>>,
+) -> Result<MessageStream, ProviderError> {
+    stream_responses_compat_with_timeouts(response, log, StreamTimeouts::default())
+}
+
+pub fn stream_responses_compat_with_timeouts(
+    response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
+    timeouts: StreamTimeouts,
 ) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -299,12 +332,12 @@ pub fn stream_responses_compat(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        // Raw-line idle timeout — see `stream_openai_compat` above.
+        // Raw-line idle timeouts — see `stream_openai_compat_with_timeouts` above.
         let timed_lines = with_line_timeout(
             framed,
-            chunk_timeout(),
-            false,
-            || chunk_timeout_error().into(),
+            timeouts.chunk,
+            timeouts.first_line,
+            move |phase| stream_timeout_error(phase, &timeouts).into(),
         );
         let message_stream = responses_api_to_streaming_message(timed_lines);
         pin!(message_stream);

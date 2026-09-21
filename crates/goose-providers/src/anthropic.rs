@@ -3,7 +3,7 @@ use crate::base::ProviderDescriptor;
 use crate::declarative::{DeclarativeProviderConfig, KeyResolver};
 use crate::errors::ProviderError;
 use crate::request_log::{start_log, LoggerHandleExt};
-use crate::stream_util::with_line_timeout;
+use crate::stream_util::{with_line_timeout, StreamTimeouts};
 use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -12,7 +12,6 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
-use std::time::Duration;
 use tokio::pin;
 use tokio_util::io::StreamReader;
 
@@ -26,25 +25,8 @@ use super::formats::anthropic::{
     is_thinking_signature_error, response_to_streaming_message, PrefixMismatchBehavior,
     ANTHROPIC_PROVIDER_NAME, INPUT_TRANSFORMATIONS_FIELD, THINKING_BINDING_CONTROLS_BETA,
 };
-use super::openai_compatible::handle_status;
+use super::openai_compatible::{handle_status, stream_timeout_error};
 use super::retry::ProviderRetry;
-const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
-
-fn chunk_timeout() -> Duration {
-    let secs = std::env::var("GOOSE_INFERENCE_CHUNK_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CHUNK_TIMEOUT_SECS);
-    Duration::from_secs(secs)
-}
-
-/// Error raised when the provider sends no data for [`chunk_timeout`].
-fn chunk_timeout_error() -> ProviderError {
-    ProviderError::NetworkError(
-        "Stream timed out waiting for next chunk — check your network connection".to_string(),
-    )
-}
-
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use rmcp::model::Tool;
@@ -71,6 +53,9 @@ pub struct AnthropicProvider {
     skip_canonical_filtering: bool,
     #[serde(skip)]
     format_options: AnthropicFormatOptions,
+    /// Idle budgets for the SSE line stream; overridable per provider.
+    #[serde(skip)]
+    stream_timeouts: StreamTimeouts,
 }
 
 /// Builder for [`AnthropicProvider`].
@@ -87,6 +72,7 @@ pub struct AnthropicProviderBuilder {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     format_options: AnthropicFormatOptions,
+    stream_timeouts: StreamTimeouts,
 }
 
 impl AnthropicProviderBuilder {
@@ -99,7 +85,13 @@ impl AnthropicProviderBuilder {
             dynamic_models: None,
             skip_canonical_filtering: false,
             format_options: AnthropicFormatOptions::default(),
+            stream_timeouts: StreamTimeouts::default(),
         }
+    }
+
+    pub fn stream_timeouts(mut self, stream_timeouts: StreamTimeouts) -> Self {
+        self.stream_timeouts = stream_timeouts;
+        self
     }
 
     pub fn api_client(mut self, api_client: ApiClient) -> Self {
@@ -159,6 +151,7 @@ impl AnthropicProviderBuilder {
             dynamic_models: self.dynamic_models,
             skip_canonical_filtering: self.skip_canonical_filtering,
             format_options: self.format_options,
+            stream_timeouts: self.stream_timeouts,
         }
     }
 }
@@ -261,14 +254,21 @@ impl AnthropicProvider {
         .inspect_err(|e| {
             let _ = log.error(e);
         })?;
+        let stream_timeouts = self.stream_timeouts;
         let stream = response.bytes_stream().map_err(io::Error::other);
         Ok(Box::pin(try_stream! {
             let reader = StreamReader::new(stream);
             let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
-            // Enforce the idle timeout on the raw SSE lines, not on the assembled
+            // Enforce the idle timeouts on the raw SSE lines, not on the assembled
             // messages: tool-call arguments are buffered and emitted as one item, so
             // a slow (but healthy) tool call used to be reported as a network error.
-            let timed_lines = with_line_timeout(framed, chunk_timeout(), false, || chunk_timeout_error().into());
+            // The first line has its own, larger budget (it covers prefill).
+            let timed_lines = with_line_timeout(
+                framed,
+                stream_timeouts.chunk,
+                stream_timeouts.first_line,
+                move |phase| stream_timeout_error(phase, &stream_timeouts).into(),
+            );
             let messages = response_to_streaming_message(timed_lines);
             pin!(messages);
             while let Some(message) = futures::StreamExt::next(&mut messages).await {
@@ -570,6 +570,9 @@ pub fn from_declarative_config(
     let timeout_secs = config
         .timeout_seconds
         .unwrap_or(DEFAULT_ANTHROPIC_TIMEOUT_SECONDS);
+
+    // Read before `config.base_url` is moved into the client below.
+    let stream_timeouts = config.stream_timeouts();
     let mut api_client = ApiClient::with_timeout_and_tls(
         config.base_url,
         auth,
@@ -608,7 +611,8 @@ pub fn from_declarative_config(
         .custom_models(custom_models)
         .dynamic_models(config.dynamic_models)
         .skip_canonical_filtering(config.skip_canonical_filtering)
-        .format_options(format_options))
+        .format_options(format_options)
+        .stream_timeouts(stream_timeouts))
 }
 
 #[cfg(test)]
@@ -685,6 +689,7 @@ mod tests {
             dynamic_models: Some(true),
             skip_canonical_filtering: false,
             format_options: AnthropicFormatOptions::default(),
+            stream_timeouts: StreamTimeouts::default(),
         }
     }
 

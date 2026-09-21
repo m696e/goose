@@ -593,8 +593,8 @@ fn with_line_timeout(
     crate::stream_util::with_line_timeout(
         stream,
         Duration::from_secs(timeout_secs),
-        true,
-        move || {
+        None,
+        move |_phase| {
             anyhow::anyhow!(
                 "Ollama stream stalled: no data received for {}s. \
                  This may indicate the model is overwhelmed by the request payload. \
@@ -666,6 +666,8 @@ mod tests {
             headers: None,
             session_id_header_override: None,
             timeout_seconds: None,
+            stream_chunk_timeout_secs: None,
+            stream_first_line_timeout_secs: None,
             supports_streaming: None,
             requires_auth: false,
             catalog_provider_id: None,
