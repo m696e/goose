@@ -3,6 +3,7 @@ use anstream::{adapter::strip_str, eprintln, println};
 use bat::WrappingMode;
 use console::{measure_text_width, style, Color, StyledObject, Term};
 use goose::agents::platform_extensions::todo::TODO_WRITE_TOOL_NAME_COMPLETE;
+use goose::agents::LlmStage;
 use goose::config::Config;
 use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
@@ -219,45 +220,30 @@ pub fn show_thinking() {
     }
 }
 
-/// Show the prefill notice: the request is in flight and the model has not
-/// produced its first token yet. Shown whether or not the thinking spinner is
-/// already up, so a second LLM call in the same turn (after a tool) is covered.
-pub fn show_prefilling() {
+/// Show the notice for a request stage that produces no output of its own.
+pub fn show_stage(stage: LlmStage) {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            let mut t = t.borrow_mut();
-            if !t.is_shown() {
-                t.show();
-            }
-            t.set_message(&prefilling_label());
-        });
+        let label = match stage {
+            LlmStage::Prefilling => "prefilling",
+            LlmStage::ToolCallReceiving => "receiving tool call",
+            LlmStage::RewritingContext => "rewriting the context",
+        };
+        show_stage_label(label);
     }
 }
 
-fn prefilling_label() -> String {
-    format!("prefilling...  {}", style("(Ctrl+C to interrupt)").dim())
-}
-
-/// Show the tool-call notice: the model has started emitting a tool call whose
-/// arguments have not finished streaming. Reception only — once the call
-/// completes the spinner is hidden with the rest of the streamed output.
-pub fn show_receiving_tool_call() {
-    if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            let mut t = t.borrow_mut();
-            if !t.is_shown() {
-                t.show();
-            }
-            t.set_message(&receiving_tool_call_label());
-        });
-    }
-}
-
-fn receiving_tool_call_label() -> String {
-    format!(
-        "receiving tool call...  {}",
-        style("(Ctrl+C to interrupt)").dim()
-    )
+fn show_stage_label(label: &str) {
+    THINKING.with(|t| {
+        let mut t = t.borrow_mut();
+        if !t.is_shown() {
+            t.show();
+        }
+        t.set_message(&format!(
+            "{}...  {}",
+            label,
+            style("(Ctrl+C to interrupt)").dim()
+        ));
+    });
 }
 
 pub fn hide_thinking() {

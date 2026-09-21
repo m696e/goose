@@ -24,8 +24,8 @@ use console::Color;
 use goose::agents::platform_extensions::developer::shell::{
     parse_shell_output_notification, ShellOutputNotificationParams, ShellOutputStream,
 };
+use goose::agents::AgentEvent;
 use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
-use goose::agents::{AgentEvent, LlmStage};
 use goose::permission::Permission;
 use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
@@ -1299,7 +1299,27 @@ impl CliSession {
         Ok(())
     }
 
+    /// Run one agent turn, rendering the stages of requests that produce no
+    /// output of their own. Those requests report through the installed sink
+    /// because their output is collected, not streamed to the terminal.
     async fn process_agent_response(
+        &mut self,
+        interactive: bool,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
+        let sink: goose::session_context::StageSink = std::sync::Arc::new(move |stage| {
+            if interactive {
+                output::show_stage(stage);
+            }
+        });
+        goose::session_context::with_stage_sink(Some(sink), async {
+            self.process_agent_response_inner(interactive, cancel_token)
+                .await
+        })
+        .await
+    }
+
+    async fn process_agent_response_inner(
         &mut self,
         interactive: bool,
         cancel_token: CancellationToken,
@@ -1493,12 +1513,7 @@ impl CliSession {
                         }
                         Some(Ok(AgentEvent::Stage(stage))) => {
                             if interactive {
-                                match stage {
-                                    LlmStage::Prefilling => output::show_prefilling(),
-                                    LlmStage::ToolCallReceiving => {
-                                        output::show_receiving_tool_call()
-                                    }
-                                }
+                                output::show_stage(stage);
                             }
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}

@@ -286,7 +286,7 @@ impl goose_context_management::CompactionModel for GooseCompactionModel<'_> {
         system: &str,
         messages: &[Message],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        crate::model_config::complete_one_shot(
+        crate::model_config::complete_one_shot_with_stage(
             self.provider,
             self.model_config,
             self.session_id,
@@ -591,6 +591,7 @@ pub fn maybe_summarize_tool_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::message::LlmStage;
     use async_trait::async_trait;
     use goose_providers::conversation::token_usage::Usage;
     use rmcp::model::{CallToolRequestParams, Tool};
@@ -702,6 +703,40 @@ mod tests {
         async fn get_context_limit(&self, _model: &str, override_limit: Option<usize>) -> usize {
             override_limit.unwrap_or_else(|| self.config.context_limit())
         }
+    }
+
+    #[tokio::test]
+    async fn reports_prefilling_then_rewriting_context() {
+        let provider = MockProvider::new(Message::assistant().with_text("<mock summary>"), 100_000);
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("fix the parser bug"),
+            Message::assistant().with_text("Looking into it"),
+        ]);
+        let model_config = provider.config.clone();
+
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let stages = std::sync::Arc::clone(&stages);
+            std::sync::Arc::new(move |stage| stages.lock().unwrap().push(stage))
+        };
+
+        crate::session_context::with_stage_sink(
+            Some(sink),
+            compact_messages(
+                &provider,
+                &model_config,
+                "test-session-id",
+                &conversation,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![LlmStage::Prefilling, LlmStage::RewritingContext]
+        );
     }
 
     #[tokio::test]

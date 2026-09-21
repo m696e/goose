@@ -1,14 +1,25 @@
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use goose_providers::conversation::message::LlmStage;
 use reqwest::header::{HeaderName, HeaderValue};
+use std::sync::Arc;
 
 pub const SESSION_ID_HEADER: &str = "agent-session-id";
+
+/// Receives the stage of an in-flight LLM request. A caller that can render
+/// progress (the CLI) installs one for the duration of a turn; requests that
+/// know their stages report them with [`report_stage`].
+pub type StageSink = Arc<dyn Fn(LlmStage) + Send + Sync>;
 
 pub const TOOL_CALL_REQUEST_ID_HEADER: &str = "agent-tool-call-request-id";
 pub const WORKING_DIR_HEADER: &str = "agent-working-dir";
 
 tokio::task_local! {
     pub static SESSION_ID: Option<String>;
+}
+
+tokio::task_local! {
+    static STAGE_SINK: Option<StageSink>;
 }
 
 pub async fn with_session_id<F>(session_id: Option<String>, f: F) -> F::Output
@@ -30,6 +41,23 @@ pub fn with_session_id_stream<'a, T: Send + 'a>(
                 .map(|item| (item, (stream, session_id)))
         },
     ))
+}
+
+/// Install the stage sink for the duration of `f`, so stages reported by
+/// requests nested anywhere inside it reach that sink.
+pub async fn with_stage_sink<F>(sink: Option<StageSink>, f: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    STAGE_SINK.scope(sink, f).await
+}
+
+/// Report the stage a request has reached. Does nothing when the caller
+/// installed no sink.
+pub fn report_stage(stage: LlmStage) {
+    if let Ok(Some(sink)) = STAGE_SINK.try_with(|sink| sink.clone()) {
+        sink(stage);
+    }
 }
 
 pub fn current_session_id() -> Option<String> {

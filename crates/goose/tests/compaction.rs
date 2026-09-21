@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
-use goose::agents::{Agent, AgentEvent, SessionConfig};
+use goose::agents::{Agent, AgentEvent, LlmStage, SessionConfig};
 use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageContent};
 use goose::conversation::Conversation;
@@ -15,7 +15,7 @@ use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
 use rmcp::model::Tool;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 struct MockCompactionProvider {
@@ -832,6 +832,64 @@ async fn test_context_limit_recovery_compaction() -> Result<()> {
         .conversation
         .expect("Session should have conversation");
     assert_conversation_compacted(&updated_conversation);
+
+    Ok(())
+}
+
+/// A compaction request reports its stage through the task-local sink the
+/// caller installed: prefilling while the summarizer request is in flight, then
+/// rewriting the context once generation starts. The sink must cover stream
+/// consumption, not just the `reply` call, because the state-machine loop
+/// compacts while its stream is being polled.
+#[tokio::test]
+async fn reports_compaction_stages_on_both_loops() -> Result<()> {
+    for use_state_machine in [false, true] {
+        let temp_dir = TempDir::new()?;
+        let agent = Agent::new();
+        let messages = vec![
+            Message::user().with_text("Hello, can you help me with something?"),
+            Message::assistant().with_text("Of course! What do you need help with?"),
+        ];
+        let session = setup_test_session(&agent, &temp_dir, "compact-stages", messages).await?;
+        let provider = Arc::new(MockCompactionProvider::new());
+        agent
+            .update_provider(provider, ModelConfig::new("mock-model"), &session.id)
+            .await?;
+
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let stages = Arc::clone(&stages);
+            Arc::new(move |stage| stages.lock().unwrap().push(stage))
+        };
+        let session_config = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        goose::session_context::with_stage_sink(Some(sink), async {
+            let mut stream = agent
+                .reply(
+                    Message::user().with_text("/compact"),
+                    session_config,
+                    use_state_machine,
+                    None,
+                )
+                .await?;
+            while let Some(event) = stream.next().await {
+                event?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![LlmStage::Prefilling, LlmStage::RewritingContext],
+            "state_machine={use_state_machine}"
+        );
+    }
 
     Ok(())
 }

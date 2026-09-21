@@ -1,7 +1,9 @@
 use crate::config::{Config, ConfigError};
-use crate::conversation::message::Message;
+use crate::conversation::message::{LlmStage, Message};
 use crate::providers::base::Provider;
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
+use goose_providers::base::collect_stream;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
@@ -131,6 +133,42 @@ pub async fn complete_one_shot(
         Some(session_id.to_string()),
         provider.complete(&one_shot_model_config, system, messages, tools),
     )
+    .await
+}
+
+/// Run a one-shot completion that reports the request's stage, for prompts
+/// whose output is collected rather than streamed to the user. Stage reporting
+/// is what tells a client that generation has started; without it the request
+/// looks stalled for its whole duration.
+pub async fn complete_one_shot_with_stage(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    system: &str,
+    messages: &[Message],
+    tools: &[Tool],
+) -> Result<(Message, ProviderUsage), ProviderError> {
+    let one_shot_model_config = one_shot_model_config(model_config.clone());
+
+    crate::session_context::with_session_id(Some(session_id.to_string()), async {
+        crate::session_context::report_stage(LlmStage::Prefilling);
+
+        let stream = provider
+            .stream(&one_shot_model_config, system, messages, tools)
+            .await?;
+
+        let mut generation_reported = false;
+        let stream = stream.inspect(move |item| {
+            if !generation_reported {
+                if let Ok((Some(_), _)) = item {
+                    generation_reported = true;
+                    crate::session_context::report_stage(LlmStage::RewritingContext);
+                }
+            }
+        });
+
+        collect_stream(Box::pin(stream)).await
+    })
     .await
 }
 

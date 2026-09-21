@@ -836,6 +836,10 @@ pub enum LlmStage {
     /// The model is streaming a tool call that has not completed yet. Reception
     /// only — the tool's execution is not part of this stage.
     ToolCallReceiving,
+    /// The model is producing the summary that rewrites the conversation.
+    /// Unlike a reply it is not streamed to the output, so the client still
+    /// needs an indicator once generation starts.
+    RewritingContext,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
