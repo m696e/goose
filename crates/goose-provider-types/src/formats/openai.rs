@@ -1,5 +1,5 @@
 use crate::base::ThinkingPreservationFormat;
-use crate::conversation::message::{Message, MessageContentBlock, ProviderMetadata};
+use crate::conversation::message::{LlmStage, Message, MessageContentBlock, ProviderMetadata};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 use crate::documents::{
     convert_document, document_media_type_is_supported, unsupported_document_text, DocumentFormat,
@@ -1385,6 +1385,9 @@ where
                 );
 
                 if !is_complete {
+                    // The args are still arriving; nothing is yielded until the
+                    // call is complete, so report the stage to the client now.
+                    yield (Some(Message::stage_signal(LlmStage::ToolCallReceiving)), None);
                     let mut done = false;
                     while !done {
                         if let Some(response_chunk) = stream.next().await {
@@ -4213,6 +4216,12 @@ data: [DONE]"#;
                 usage_count += 1;
             }
             if let Some(msg) = message {
+                // The tool-call reception stage signal is a control frame:
+                // the agent loop consumes it and never stores it, so it is
+                // not conversation content.
+                if msg.metadata.llm_stage.is_some() {
+                    continue;
+                }
                 if let MessageContentBlock::ToolRequest(request) = &msg.content[0] {
                     assert!(!msg.metadata.output_token_limit_reached);
                     assert_eq!(msg.id.as_deref(), Some("test-id"));
@@ -4260,6 +4269,12 @@ data: [DONE]"#;
                 usage_count += 1;
             }
             if let Some(msg) = message {
+                // The tool-call reception stage signal is a control frame:
+                // the agent loop consumes it and never stores it, so it is
+                // not conversation content.
+                if msg.metadata.llm_stage.is_some() {
+                    continue;
+                }
                 assert!(msg.metadata.output_token_limit_reached);
                 assert_eq!(msg.id.as_deref(), Some("test-id"));
                 for content in msg.content {
@@ -5427,6 +5442,12 @@ data: [DONE]"#;
         while let Some(result) = messages.next().await {
             let (message, _usage) = result?;
             if let Some(msg) = message {
+                // The tool-call reception stage signal is a control frame:
+                // the agent loop consumes it and never stores it, so it is
+                // not conversation content.
+                if msg.metadata.llm_stage.is_some() {
+                    continue;
+                }
                 history.push(msg);
             }
         }

@@ -75,7 +75,9 @@ async fn agent_with_dummy_api() -> Result<(Agent, Arc<DummyApi>, String, tempfil
     Ok((agent, api, session.id, temp_dir))
 }
 
-async fn agent_with_calculator() -> Result<(
+async fn agent_with_calculator(
+    goose_mode: GooseMode,
+) -> Result<(
     Agent,
     Arc<DummyApi>,
     String,
@@ -83,9 +85,7 @@ async fn agent_with_calculator() -> Result<(
     tempfile::TempDir,
 )> {
     let (agent, api, session_id, temp_dir) = agent_with_dummy_api().await?;
-    agent
-        .update_goose_mode(GooseMode::Approve, &session_id)
-        .await?;
+    agent.update_goose_mode(goose_mode, &session_id).await?;
     let calculator = Arc::new(CalculatorExtension::new(
         agent.config.session_manager.action_required(),
     ));
@@ -258,7 +258,8 @@ async fn both_loops_keep_recipe_continuations_within_the_turn_budget() -> Result
 #[tokio::test]
 async fn state_machine_confirmation_through_agent_resumes_tool_call() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
-    let (mut agent, api, session_id, calculator, temp_dir) = agent_with_calculator().await?;
+    let (mut agent, api, session_id, calculator, temp_dir) =
+        agent_with_calculator(GooseMode::Approve).await?;
     let hook_dir = tempfile::tempdir()?;
     let plugin_dir = hook_dir.path().join("test-plugin");
     std::fs::create_dir_all(plugin_dir.join("hooks"))?;
@@ -1051,6 +1052,63 @@ async fn emits_prefilling_stage_before_the_first_message_on_both_loops() -> Resu
             prefilling_at < first_message_at,
             "prefilling must be reported before the first message (state_machine={use_state_machine})"
         );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn emits_tool_call_stage_before_the_tool_request_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, calculator, _temp_dir) =
+            agent_with_calculator(GooseMode::Auto).await?;
+        api.on("add one").call(ADD, value(1));
+        api.on("result: 1").reply("the total is 1");
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(2),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("add one"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let stage_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Stage(LlmStage::ToolCallReceiving)))
+            .unwrap_or_else(|| panic!("no tool-call stage (state_machine={use_state_machine})"));
+        let request_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Message(message)
+                        if message
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+                )
+            })
+            .unwrap_or_else(|| panic!("no tool request (state_machine={use_state_machine})"));
+        assert!(
+            stage_at < request_at,
+            "tool-call stage must precede the tool request (state_machine={use_state_machine})"
+        );
+        assert_eq!(calculator.total(), 1);
     }
 
     Ok(())

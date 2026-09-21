@@ -823,6 +823,21 @@ impl MessageUsage {
 pub type OperationNotes =
     std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>;
 
+/// The stage of an in-flight LLM request. A provider stream decoder reports it
+/// on a contentless message so clients can render a status indicator that
+/// reflects the request; the agent surfaces it as a stage event and drops the
+/// message instead of persisting it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmStage {
+    /// The request was sent and the model has not started streaming yet
+    /// (time-to-first-token).
+    Prefilling,
+    /// The model is streaming a tool call that has not completed yet. Reception
+    /// only — the tool's execution is not part of this stage.
+    ToolCallReceiving,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 /// Metadata for message visibility and model inference details
 #[serde(rename_all = "camelCase")]
@@ -851,6 +866,11 @@ pub struct MessageMetadata {
     /// happened. Never sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operations: Option<Box<OperationNotes>>,
+    /// A transient request-stage signal set by a provider stream decoder on a
+    /// contentless message. The agent consumes it and drops the message rather
+    /// than persisting it, so this never reaches a session file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_stage: Option<LlmStage>,
 }
 
 impl Default for MessageMetadata {
@@ -864,6 +884,7 @@ impl Default for MessageMetadata {
             turn_context: false,
             usage: None,
             operations: None,
+            llm_stage: None,
         }
     }
 }
@@ -1259,6 +1280,13 @@ impl Message {
             data,
         ))
         .with_metadata(MessageMetadata::user_only())
+    }
+
+    /// A contentless message that only carries a transient request-stage signal.
+    pub fn stage_signal(stage: LlmStage) -> Self {
+        let mut message = Message::assistant();
+        message.metadata.llm_stage = Some(stage);
+        message
     }
 
     pub fn with_error<S: Into<String>>(self, kind: MessageErrorKind, message: S) -> Self {

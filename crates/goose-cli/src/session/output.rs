@@ -238,6 +238,28 @@ fn prefilling_label() -> String {
     format!("prefilling...  {}", style("(Ctrl+C to interrupt)").dim())
 }
 
+/// Show the tool-call notice: the model has started emitting a tool call whose
+/// arguments have not finished streaming. Reception only — once the call
+/// completes the spinner is hidden with the rest of the streamed output.
+pub fn show_receiving_tool_call() {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| {
+            let mut t = t.borrow_mut();
+            if !t.is_shown() {
+                t.show();
+            }
+            t.set_message(&receiving_tool_call_label());
+        });
+    }
+}
+
+fn receiving_tool_call_label() -> String {
+    format!(
+        "receiving tool call...  {}",
+        style("(Ctrl+C to interrupt)").dim()
+    )
+}
+
 pub fn hide_thinking() {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().hide());

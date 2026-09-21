@@ -2867,6 +2867,11 @@ impl Agent {
                             }
 
                             if let Some(response) = response {
+                                if let Some(stage) = response.metadata.llm_stage {
+                                    yield AgentEvent::Stage(stage);
+                                    continue;
+                                }
+
                                 provider_reached_output_token_limit |=
                                     response.metadata.output_token_limit_reached;
 

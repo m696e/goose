@@ -502,6 +502,14 @@ pub(crate) async fn stream_response_from_provider(
                 let (msg_opt, usage_opt) = result?;
 
                 if let Some(msg) = msg_opt {
+                    if msg.metadata.llm_stage.is_some() {
+                        // A stage signal is a control frame, not part of the
+                        // reply. Folding it into the accumulator would hand the
+                        // model's content to a message the agent loop skips as a
+                        // stage notice, losing the whole response.
+                        yield (Some(msg), None);
+                        continue;
+                    }
                     if first_content_at.is_none() && message_has_timing_content(&msg) {
                         first_content_at = Some(std::time::Instant::now());
                     }

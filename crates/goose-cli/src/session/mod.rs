@@ -1495,6 +1495,9 @@ impl CliSession {
                             if interactive {
                                 match stage {
                                     LlmStage::Prefilling => output::show_prefilling(),
+                                    LlmStage::ToolCallReceiving => {
+                                        output::show_receiving_tool_call()
+                                    }
                                 }
                             }
                         }
