@@ -643,6 +643,7 @@ mod tests {
                     Ok(AgentEvent::McpNotification(_)) => {}
                     Ok(AgentEvent::Usage(_)) => {}
                     Ok(AgentEvent::MessageUsage { .. }) => {}
+                    Ok(AgentEvent::Stage(_)) => {}
                     Ok(AgentEvent::HistoryReplaced(_updated_conversation)) => {
                         // We should update the conversation here, but we're not reading it
                     }

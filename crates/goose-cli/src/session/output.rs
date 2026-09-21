@@ -192,6 +192,12 @@ impl ThinkingIndicator {
     pub fn is_shown(&self) -> bool {
         self.spinner.is_some()
     }
+
+    pub fn set_message(&mut self, message: &str) {
+        if let Some(spinner) = self.spinner.as_mut() {
+            spinner.set_message(message.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +217,25 @@ pub fn show_thinking() {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().show());
     }
+}
+
+/// Show the prefill notice: the request is in flight and the model has not
+/// produced its first token yet. Shown whether or not the thinking spinner is
+/// already up, so a second LLM call in the same turn (after a tool) is covered.
+pub fn show_prefilling() {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| {
+            let mut t = t.borrow_mut();
+            if !t.is_shown() {
+                t.show();
+            }
+            t.set_message(&prefilling_label());
+        });
+    }
+}
+
+fn prefilling_label() -> String {
+    format!("prefilling...  {}", style("(Ctrl+C to interrupt)").dim())
 }
 
 pub fn hide_thinking() {
@@ -304,13 +329,9 @@ pub fn is_showing_thinking() -> bool {
     THINKING.with(|t| t.borrow().is_shown())
 }
 
-pub fn set_thinking_message(s: &String) {
+pub fn set_thinking_message(s: &str) {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
-                spinner.set_message(s);
-            }
-        });
+        THINKING.with(|t| t.borrow_mut().set_message(s));
     }
 }
 

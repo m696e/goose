@@ -24,8 +24,8 @@ use console::Color;
 use goose::agents::platform_extensions::developer::shell::{
     parse_shell_output_notification, ShellOutputNotificationParams, ShellOutputStream,
 };
-use goose::agents::AgentEvent;
 use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
+use goose::agents::{AgentEvent, LlmStage};
 use goose::permission::Permission;
 use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
@@ -1491,6 +1491,13 @@ impl CliSession {
                         Some(Ok(AgentEvent::Usage(usage))) => {
                             last_usage = Some(usage);
                         }
+                        Some(Ok(AgentEvent::Stage(stage))) => {
+                            if interactive {
+                                match stage {
+                                    LlmStage::Prefilling => output::show_prefilling(),
+                                }
+                            }
+                        }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
@@ -2556,7 +2563,7 @@ fn display_log_notification(
             }
         }
     } else if output::is_showing_thinking() {
-        output::set_thinking_message(&formatted_message.to_string());
+        output::set_thinking_message(formatted_message);
     } else {
         progress_bars.log(formatted_message);
     }

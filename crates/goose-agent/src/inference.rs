@@ -25,6 +25,8 @@ use crate::operation::{
 };
 use goose_provider_types::maybe_send::{MaybeSend, MaybeSync};
 
+use crate::events::{AgentEvent, LlmStage};
+
 pub struct PreparedInferenceRequest {
     pub system_prompt: String,
     pub tools: Vec<rmcp::model::Tool>,
@@ -516,6 +518,8 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                 let conversation_for_provider = Conversation::new_unvalidated(
                     merge_consecutive_messages_for_request(fixed.messages().clone()),
                 );
+
+                emit.emit(AgentEvent::Stage(LlmStage::Prefilling)).await;
 
                 let stream = self
                     .provider

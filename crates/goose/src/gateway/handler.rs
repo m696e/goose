@@ -785,6 +785,7 @@ impl GatewayHandler {
                         "gateway stream: history replaced #{event_count}"
                     );
                 }
+                Ok(AgentEvent::Stage(_)) => {}
                 Err(e) => {
                     tracing::error!(session_id, error = %e, "gateway stream: error at event #{event_count}");
                     // Stop typing indicator before sending error.

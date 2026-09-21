@@ -21,7 +21,7 @@ use crate::agents::extension::ExtensionConfig;
 use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
 use crate::agents::mcp_client::McpClientTrait;
 use crate::agents::state_machine::ops_toolcalling::EXPIRED_APPROVAL_RESPONSE;
-use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
+use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, LlmStage, SessionConfig};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
@@ -1009,4 +1009,49 @@ async fn bang_shell_not_executed_in_legacy_loop() -> Result<()> {
 async fn bang_shell_visibility_is_enforced_when_state_machine_is_enabled() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
     assert_bang_shell_uses_only_user_visible_content().await
+}
+
+#[tokio::test]
+async fn emits_prefilling_stage_before_the_first_message_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        api.on("hello").reply("hi there");
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let prefilling_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Stage(LlmStage::Prefilling)))
+            .unwrap_or_else(|| panic!("no prefilling stage (state_machine={use_state_machine})"));
+        let first_message_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Message(_)))
+            .unwrap_or_else(|| panic!("no message event (state_machine={use_state_machine})"));
+        assert!(
+            prefilling_at < first_message_at,
+            "prefilling must be reported before the first message (state_machine={use_state_machine})"
+        );
+    }
+
+    Ok(())
 }
