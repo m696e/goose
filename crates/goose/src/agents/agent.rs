@@ -31,6 +31,7 @@ use crate::agents::final_output_tool::{
 };
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::provider_manager::ProviderManager;
+use crate::agents::request_size;
 use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::ops_recipe;
 use crate::agents::state_machine::{
@@ -39,9 +40,10 @@ use crate::agents::state_machine::{
     CompactionOperation, DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation,
     ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
     GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation, Operation, ProjectOperation,
-    RecipeOperation, RetryOperation, SkillOperation, SlashCommandOperation, StateMachine,
-    StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
-    ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
+    RecipeOperation, RequestSizeOperation, RetryOperation, SkillOperation, SlashCommandOperation,
+    StateMachine, StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation,
+    ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
+    UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::types::{
@@ -1718,6 +1720,7 @@ impl Agent {
                 context_limit,
                 compaction_threshold,
             )));
+            operations.push(Arc::new(RequestSizeOperation::new(provider.clone())));
         }
         let remaining_operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
             Arc::new(ToolPairCompactionOperation::new(
@@ -2646,6 +2649,8 @@ impl Agent {
             let mut retrying_after_empty_turn = false;
             let mut provider_error_retries = 0u32;
             let mut retrying_after_provider_error = false;
+            let mut request_size_attempts = 0u32;
+            let mut retrying_after_oversized_request = false;
             let mut last_assistant_text = String::new();
             let mut turn_total_usage = Usage::default();
             let mut goal_check_pending = false;
@@ -2800,6 +2805,8 @@ impl Agent {
                     retrying_after_empty_turn = false;
                 } else if retrying_after_provider_error {
                     retrying_after_provider_error = false;
+                } else if retrying_after_oversized_request {
+                    retrying_after_oversized_request = false;
                 } else {
                     turns_taken += 1;
                 }
@@ -3261,6 +3268,40 @@ impl Agent {
                             );
                             break;
                         }
+                        // A provider that refuses the request on its size has not
+                        // run out of context: the payload is too many bytes, and
+                        // only the content can be made smaller. Hand the model a
+                        // description of what to shrink and let it decide, bounded
+                        // so a model that keeps resending the same request does not
+                        // loop forever.
+                        Err(ref provider_err @ ProviderError::RequestTooLarge(ref details))
+                            if request_size_attempts < request_size::MAX_REQUEST_SIZE_ADVISORIES as u32 =>
+                        {
+                            provider_errored = true;
+                            #[cfg(feature = "telemetry")]
+                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
+                            request_size_attempts += 1;
+                            retrying_after_oversized_request = true;
+
+                            let limit = self.provider().await?.max_request_bytes();
+                            let advisory =
+                                request_size::oversized_request_message(&conversation, details, limit);
+                            warn!(
+                                "Provider refused the request as too large; asking the model to shrink it ({}/{}): {}",
+                                request_size_attempts, request_size::MAX_REQUEST_SIZE_ADVISORIES, provider_err
+                            );
+                            push_message_with_id(
+                                &mut messages_to_add,
+                                Message::user().with_text(advisory).with_visibility(false, true),
+                            );
+                            yield AgentEvent::Message(
+                                Message::assistant().with_system_notification(
+                                    SystemNotificationType::InlineMessage,
+                                    "The request exceeded the provider's size limit. Asking the model to reduce it...",
+                                )
+                            );
+                            break;
+                        }
                         #[allow(unused_variables)]
                         Err(ref provider_err @ ProviderError::ContextLengthExceeded(_)) => {
                             provider_errored = true;
@@ -3459,6 +3500,10 @@ impl Agent {
                             // The provider call failed retryably and the turn is
                             // being resent; skip the nudges and retry logic that
                             // would otherwise end it.
+                        }
+                        None if retrying_after_oversized_request => {
+                            // The turn is being resent after goose told the model
+                            // what to shrink; skip the nudges that would end it.
                         }
                         None if did_recovery_compact_this_iteration => {
                             // continue from last user message after recovery compact

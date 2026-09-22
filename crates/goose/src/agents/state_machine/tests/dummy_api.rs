@@ -60,6 +60,13 @@ enum ApiResponse {
         remaining: Arc<AtomicUsize>,
         reply: String,
     },
+    /// Fails with HTTP 413 and a body saying the request was too large, a
+    /// refusal whose cause the model can act on.
+    PayloadTooLargeTimesThenReply {
+        message: String,
+        remaining: Arc<AtomicUsize>,
+        reply: String,
+    },
 }
 
 #[derive(Clone)]
@@ -387,6 +394,25 @@ impl<'a> ApiRuleBuilder<'a> {
         self.api
     }
 
+    /// Fails with a 413 for the first `failures` matching requests, then replies
+    /// with `reply`.
+    pub(super) fn payload_too_large_times(
+        self,
+        failures: usize,
+        message: impl Into<String>,
+        reply: impl Into<String>,
+    ) -> &'a DummyApi {
+        self.api.add_rule(
+            self.matcher,
+            ApiResponse::PayloadTooLargeTimesThenReply {
+                message: message.into(),
+                remaining: Arc::new(AtomicUsize::new(failures)),
+                reply: reply.into(),
+            },
+        );
+        self.api
+    }
+
     fn configured(self, response: ApiResponse) -> ConfiguredResponse<'a> {
         ConfiguredResponse {
             api: self.api,
@@ -589,6 +615,24 @@ impl DummyApiState {
                     .is_ok();
                 if failed {
                     ResponseTemplate::new(400).set_body_json(api_error(message))
+                } else {
+                    sse_response(reply_events(
+                        &meta(reply.chars().count() as i32),
+                        &reply,
+                        None,
+                    ))
+                }
+            }
+            ApiResponse::PayloadTooLargeTimesThenReply {
+                message,
+                remaining,
+                reply,
+            } => {
+                let failed = remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if failed {
+                    ResponseTemplate::new(413).set_body_json(api_error(message))
                 } else {
                     sse_response(reply_events(
                         &meta(reply.chars().count() as i32),

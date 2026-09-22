@@ -1264,3 +1264,167 @@ async fn does_not_resend_the_turn_after_a_permanent_provider_error_on_both_loops
 
     Ok(())
 }
+
+/// The compaction marker, so a test can prove the summarizer never ran.
+const COMPACTION_MARKER: &str = "An llm context limit was reached";
+
+fn compacted(api: &crate::agents::state_machine::tests::dummy_api::DummyApi) -> bool {
+    api.calls()
+        .iter()
+        .any(|call| call.system_contains(COMPACTION_MARKER))
+}
+
+/// A request the provider refused for its size is not an exhausted context: the
+/// model is told what to shrink and gets to continue, and no summarizer runs.
+#[tokio::test]
+async fn tells_the_model_to_shrink_a_request_refused_for_size_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_STATE_MACHINE", None::<&str>),
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+    ]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        api.on("hello").payload_too_large_times(
+            2,
+            "Request body is too large",
+            "recovered after shrinking the request",
+        );
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(4),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message) => Some(rendered_text(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            text.contains("recovered after shrinking the request"),
+            "the turn should recover once the model shrinks the request \
+             (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !text.contains("too long for the model's context window"),
+            "a size refusal must not be reported as a context-window problem \
+             (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !compacted(&api),
+            "a request that is too large must not be compacted \
+             (state_machine={use_state_machine})"
+        );
+        let told = api
+            .calls()
+            .iter()
+            .any(|call| call.input_contains("rejected as too large"));
+        assert!(
+            told,
+            "the model must be told why the request was refused \
+             (state_machine={use_state_machine})"
+        );
+        assert!(
+            api.calls()
+                .iter()
+                .any(|call| call.input_contains("Request body is too large")),
+            "the provider's own words should reach the model \
+             (state_machine={use_state_machine})"
+        );
+    }
+
+    Ok(())
+}
+
+/// A model that keeps resending the same oversized request does not get to loop:
+/// the advisories are bounded and the refusal is then surfaced to the user.
+#[tokio::test]
+async fn gives_up_on_a_request_that_stays_too_large_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_STATE_MACHINE", None::<&str>),
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+    ]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        api.on("hello").payload_too_large_times(
+            100,
+            "Request body is too large",
+            "should never be reached",
+        );
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(4),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message) => Some(rendered_text(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            !compacted(&api),
+            "a request that is too large must not be compacted \
+             (state_machine={use_state_machine})"
+        );
+        assert!(
+            api.call_count() <= 4,
+            "the advisories must be bounded (state_machine={use_state_machine}); \
+             calls={}",
+            api.call_count()
+        );
+        assert!(
+            text.contains("Request too large"),
+            "the refusal must reach the user once goose stops asking \
+             (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !text.contains("should never be reached"),
+            "no reply should be produced (state_machine={use_state_machine})"
+        );
+    }
+
+    Ok(())
+}
