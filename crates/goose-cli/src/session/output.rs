@@ -232,6 +232,33 @@ pub fn show_stage(stage: LlmStage) {
     }
 }
 
+/// Orient the thinking indicator at a message that is about to be rendered. A
+/// message carrying nothing but thinking is not written anywhere unless the
+/// user asked to see the thinking, so the indicator stays up as a notice for
+/// that stage; any other message replaces it with its own output.
+pub fn update_thinking_indicator(message: &Message) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    if should_show_thinking() || has_visible_output(message) {
+        hide_thinking();
+    } else {
+        show_stage_label("thinking");
+    }
+}
+
+/// Whether rendering this message writes something the user will see. A message
+/// that carries nothing but thinking writes nothing, and a message the user
+/// cannot see is not rendered at all.
+fn has_visible_output(message: &Message) -> bool {
+    message.is_user_visible()
+        && message
+            .user_visible_content()
+            .content
+            .iter()
+            .any(|content| !matches!(content, MessageContent::Thinking(_)))
+}
+
 fn show_stage_label(label: &str) {
     THINKING.with(|t| {
         let mut t = t.borrow_mut();
@@ -2059,6 +2086,30 @@ mod tests {
             ),
             "/v/l/p/w/m/components/file.txt"
         );
+    }
+
+    #[test]
+    fn a_message_of_thinking_alone_writes_nothing() {
+        let message = Message::assistant()
+            .with_content(MessageContent::thinking("weighing the options", ""))
+            .with_content(MessageContent::thinking("still weighing them", ""));
+        assert!(!has_visible_output(&message));
+    }
+
+    #[test]
+    fn a_message_carrying_thinking_and_text_writes_something() {
+        let message = Message::assistant()
+            .with_content(MessageContent::thinking("weighing the options", ""))
+            .with_content(MessageContent::text("here is the answer"));
+        assert!(has_visible_output(&message));
+    }
+
+    #[test]
+    fn a_message_the_user_cannot_see_writes_nothing() {
+        let message = Message::assistant()
+            .with_text("an internal note")
+            .with_visibility(false, true);
+        assert!(!has_visible_output(&message));
     }
 
     #[test]
