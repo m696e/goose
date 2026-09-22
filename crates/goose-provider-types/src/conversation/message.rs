@@ -262,6 +262,7 @@ pub struct SystemNotificationContent {
 pub enum MessageErrorKind {
     Authentication,
     ContextLengthExceeded,
+    RequestTooLarge,
     CreditsExhausted,
     #[serde(other)]
     Other,
@@ -273,6 +274,7 @@ impl From<&crate::errors::ProviderError> for MessageErrorKind {
         match err {
             ProviderError::Authentication(_) => MessageErrorKind::Authentication,
             ProviderError::ContextLengthExceeded(_) => MessageErrorKind::ContextLengthExceeded,
+            ProviderError::RequestTooLarge(_) => MessageErrorKind::RequestTooLarge,
             ProviderError::CreditsExhausted { .. } => MessageErrorKind::CreditsExhausted,
             _ => MessageErrorKind::Other,
         }
@@ -1307,6 +1309,13 @@ impl Message {
             ProviderError::ContextLengthExceeded(_) => {
                 format!("{err}\n\nThe conversation is too long for the model's context window.")
             }
+            ProviderError::RequestTooLarge(_) => {
+                format!(
+                    "{err}\n\nThe request was too large to send. Some providers count \
+                     attachments in bytes rather than tokens, so this is not a context-window \
+                     problem: reduce the size of the attached files or tool output."
+                )
+            }
             _ => format!(
                 "Ran into this error: {err}.\n\n\
                  Please retry if you think this is a transient or recoverable error."
@@ -1470,6 +1479,40 @@ mod tests {
         assert_eq!(message.error_kind(), Some(MessageErrorKind::Authentication));
         assert!(message.is_user_visible());
         assert!(!message.is_agent_visible());
+    }
+
+    #[test]
+    fn provider_size_refusal_does_not_claim_the_context_is_too_long() {
+        let message = Message::from_provider_error(&ProviderError::RequestTooLarge(
+            "Request body is too large".to_string(),
+        ));
+
+        assert_eq!(
+            message.error_kind(),
+            Some(MessageErrorKind::RequestTooLarge)
+        );
+        // Error blocks are not part of `as_concat_text`; read the block directly.
+        let text = message
+            .content
+            .iter()
+            .find_map(|content| content.as_error())
+            .map(|error| error.message.clone())
+            .expect("error content");
+        assert!(
+            !text.contains("too long for the model's context window"),
+            "a byte-size refusal must not be reported as a context-window problem: {text}"
+        );
+        assert!(text.contains("too large"), "got: {text}");
+    }
+
+    #[test]
+    fn request_too_large_kind_round_trips_through_serde() {
+        let json = serde_json::to_string(&MessageErrorKind::RequestTooLarge).unwrap();
+        assert_eq!(json, "\"requestTooLarge\"");
+        assert_eq!(
+            serde_json::from_str::<MessageErrorKind>(&json).unwrap(),
+            MessageErrorKind::RequestTooLarge
+        );
     }
 
     #[test]

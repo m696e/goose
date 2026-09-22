@@ -689,6 +689,12 @@ pub trait Provider: MaybeSend + MaybeSync {
         false
     }
 
+    /// The largest request body this provider accepts, in bytes, when known.
+    /// `None` means the limit is unknown and callers must not guess one.
+    fn max_request_bytes(&self) -> Option<usize> {
+        None
+    }
+
     fn uses_local_session_naming(&self) -> bool {
         self.manages_own_context()
     }

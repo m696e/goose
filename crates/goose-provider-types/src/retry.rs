@@ -135,6 +135,9 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
         | ProviderError::NetworkError(_) => true,
         ProviderError::RequestFailed(message) if is_permanent_request_failure(message) => false,
         ProviderError::RequestFailed(_) => !config.transient_only,
+        // The payload is identical on every attempt; only the caller can shrink
+        // it, so retrying here would just spend the same bytes again.
+        ProviderError::RequestTooLarge(_) => false,
         _ => false,
     }
 }
@@ -387,6 +390,20 @@ mod tests {
             "Bad request (400): Upstream provider returned an error.".into(),
         );
         assert!(should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_a_request_the_provider_refused_for_size() {
+        // Same bytes on every attempt; only the caller can shrink the payload.
+        let config = RetryConfig::default();
+        assert!(!should_retry(
+            &ProviderError::RequestTooLarge("Request body is too large".into()),
+            &config
+        ));
+        assert!(!should_retry(
+            &ProviderError::RequestTooLarge("Request body is too large".into()),
+            &RetryConfig::default().transient_only()
+        ));
     }
 
     #[test]

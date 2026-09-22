@@ -15,6 +15,14 @@ pub enum ProviderError {
     #[error("Context length exceeded: {0}")]
     ContextLengthExceeded(String),
 
+    /// The provider refused the request because the body was too many bytes to
+    /// send. Distinct from [`ProviderError::ContextLengthExceeded`]: the
+    /// conversation may be nowhere near the model's token window and still be
+    /// too large once attachments are encoded, and the remedy is to shrink the
+    /// payload rather than to summarize the conversation.
+    #[error("Request too large: {0}")]
+    RequestTooLarge(String),
+
     #[error("Rate limit exceeded: {details}")]
     RateLimitExceeded {
         details: String,
@@ -70,6 +78,7 @@ impl ProviderError {
             ProviderError::NotConfigured => "not_configured",
             ProviderError::Authentication(_) => "auth",
             ProviderError::ContextLengthExceeded(_) => "context_length",
+            ProviderError::RequestTooLarge(_) => "request_too_large",
             ProviderError::RateLimitExceeded { .. } => "rate_limit",
             ProviderError::ServerError(_) => "server",
             ProviderError::NetworkError(_) => "network",

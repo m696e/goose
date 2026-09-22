@@ -201,6 +201,27 @@ fn is_context_length_exceeded_message(text: &str) -> bool {
         .iter()
         .any(|phrase| text_lower.contains(phrase));
 
+    if mentions_prompt_input_tokens && mentions_limit && mentions_overflow {
+        return true;
+    }
+
+    text_lower.contains("many-image") && text_lower.contains("exceed")
+}
+
+/// Providers that refuse a request for its byte size say so in prose. This is a
+/// payload problem, not a token-window problem, and the remedy is to shrink the
+/// request rather than to summarize the conversation — so it is classified
+/// separately and never as context length.
+fn is_request_too_large_message(text: &str) -> bool {
+    let text_lower = text.to_lowercase();
+
+    let mentions_overflow = ["exceed", "too long", "too large", "over the limit"]
+        .iter()
+        .any(|phrase| text_lower.contains(phrase));
+    if !mentions_overflow {
+        return false;
+    }
+
     let words = text_lower.split(|character: char| !character.is_ascii_alphanumeric());
     let mentions_request = words.clone().any(|word| word == "request");
     let mentions_bytes = words.clone().any(|word| matches!(word, "byte" | "bytes"));
@@ -227,18 +248,10 @@ fn is_context_length_exceeded_message(text: &str) -> bool {
     ]
     .iter()
     .any(|phrase| text_lower.contains(phrase));
-    let mentions_byte_limit = mentions_request_data_size
+
+    mentions_request_data_size
         || request_data_too_large
-        || (mentions_content_length && (mentions_request || mentions_bytes));
-    if mentions_byte_limit && mentions_overflow {
-        return true;
-    }
-
-    if mentions_prompt_input_tokens && mentions_limit && mentions_overflow {
-        return true;
-    }
-
-    text_lower.contains("many-image") && text_lower.contains("exceed")
+        || (mentions_content_length && (mentions_request || mentions_bytes))
 }
 
 pub fn map_http_error_to_provider_error(
@@ -274,10 +287,24 @@ pub fn map_http_error_to_provider_error(
             details: extract_message(),
             top_up_url: None,
         },
-        StatusCode::PAYLOAD_TOO_LARGE => ProviderError::ContextLengthExceeded(extract_message()),
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            let message = extract_message();
+            // A 413 is a payload-size refusal on most gateways, but some
+            // providers (e.g. Anthropic) use it for a prompt that overflows the
+            // context window. Only the body's wording can tell them apart, and
+            // the context-window reading stays the fallback because compaction
+            // is the established remedy for it.
+            if is_request_too_large_message(&message) {
+                ProviderError::RequestTooLarge(message)
+            } else {
+                ProviderError::ContextLengthExceeded(message)
+            }
+        }
         StatusCode::BAD_REQUEST => {
             let payload_str = extract_message();
-            if is_context_length_exceeded(payload.as_ref(), &payload_str) {
+            if is_request_too_large_message(&payload_str) {
+                ProviderError::RequestTooLarge(payload_str)
+            } else if is_context_length_exceeded(payload.as_ref(), &payload_str) {
                 ProviderError::ContextLengthExceeded(payload_str)
             } else {
                 ProviderError::RequestFailed(format!("Bad request (400): {}", payload_str))
@@ -726,11 +753,6 @@ mod tests {
             "Input token count exceeds the maximum number of tokens allowed",
             "Please reduce the length of the messages",
             "prompt is too long for this model",
-            "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): 34021227, Limit(bytes): 33554432.",
-            "Request body size exceeds the maximum allowed limit",
-            "Request body is too large",
-            "Request payload too large",
-            "Content-Length exceeds the maximum allowed request size",
             "At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels",
         ];
 
@@ -738,6 +760,53 @@ mod tests {
             assert!(
                 is_context_length_exceeded_message(message),
                 "expected context-length match for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_size_classifier_accepts_payload_size_refusals() {
+        let messages = [
+            "Request body is too large",
+            "Request payload too large",
+            "Request body size exceeds the maximum allowed limit",
+            "Content-Length exceeds the maximum allowed request size",
+            "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): 34021227, Limit(bytes): 33554432.",
+        ];
+
+        for message in messages {
+            assert!(
+                is_request_too_large_message(message),
+                "expected request-size match for: {message}"
+            );
+        }
+        // A context-window message stays context length even when it shares the
+        // "request"/"exceeds" wording.
+        assert!(!is_request_too_large_message(
+            "This request exceeds the maximum context length"
+        ));
+        assert!(!is_request_too_large_message(
+            "prompt is too long for this model"
+        ));
+        assert!(is_context_length_exceeded_message(
+            "This request exceeds the maximum context length"
+        ));
+    }
+
+    #[test]
+    fn payload_size_refusals_are_not_classified_as_context_length() {
+        let messages = [
+            "Request body is too large",
+            "Request payload too large",
+            "Request body size exceeds the maximum allowed limit",
+            "Content-Length exceeds the maximum allowed request size",
+            "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): 34021227, Limit(bytes): 33554432.",
+        ];
+
+        for message in messages {
+            assert!(
+                !is_context_length_exceeded_message(message),
+                "a byte-size refusal must not compact the conversation: {message}"
             );
         }
     }
@@ -832,5 +901,61 @@ mod tests {
                 "unexpected classification for {case}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn payload_too_large_is_classified_by_the_body_wording() {
+        let cases = [
+            (
+                "gateway rejecting an oversized body",
+                json!({ "error": { "message": "Request body is too large" } }),
+                true,
+            ),
+            (
+                "gateway rejecting an oversized body on a 400",
+                json!({ "error": { "message": "Request payload too large" } }),
+                true,
+            ),
+            (
+                // Anthropic reports a prompt that overflows the window as 413,
+                // and compaction is the right remedy for that one.
+                "context window overflow reported as 413",
+                json!({ "error": { "message": "prompt is too long: 210000 tokens > 200000 maximum" } }),
+                false,
+            ),
+            (
+                "opaque 413 body",
+                json!({ "error": { "message": "upstream failure" } }),
+                false,
+            ),
+        ];
+
+        for (case, payload, expected_request_too_large) in cases {
+            for status in [StatusCode::PAYLOAD_TOO_LARGE, StatusCode::BAD_REQUEST] {
+                let error = map_http_error_to_provider_error(
+                    status,
+                    Some(payload.clone()),
+                    "http://test/endpoint",
+                );
+                assert_eq!(
+                    matches!(&error, ProviderError::RequestTooLarge(_)),
+                    expected_request_too_large,
+                    "unexpected classification for {case} ({status}): {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_size_refusal_never_compacts() {
+        let error = map_http_error_to_provider_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Some(json!({ "error": { "message": "Request body is too large" } })),
+            "http://test/endpoint",
+        );
+        assert!(
+            !matches!(&error, ProviderError::ContextLengthExceeded(_)),
+            "a byte-size refusal must not be sent down the compaction path: {error:?}"
+        );
     }
 }

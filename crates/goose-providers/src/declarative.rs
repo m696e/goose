@@ -172,6 +172,13 @@ pub struct DeclarativeProviderConfig {
     /// its first byte arrives. Defaults to
     /// `GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS` / 120s.
     pub stream_first_line_timeout_secs: Option<u64>,
+    /// The largest request body this provider accepts, in bytes. Gateways that
+    /// count encoded attachments instead of tokens reject a request that is
+    /// nowhere near the model's context window; knowing the ceiling lets goose
+    /// shrink the payload before sending instead of discovering it from a
+    /// refusal.
+    #[serde(default)]
+    pub max_request_bytes: Option<usize>,
     pub supports_streaming: Option<bool>,
     #[serde(default = "default_requires_auth")]
     pub requires_auth: bool,

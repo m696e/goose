@@ -141,6 +141,9 @@ pub struct OpenAiProvider {
     /// Idle budgets for the SSE line stream; overridable per provider.
     #[serde(skip)]
     stream_timeouts: StreamTimeouts,
+    /// Largest request body accepted, in bytes, when the provider declares one.
+    #[serde(skip)]
+    max_request_bytes: Option<usize>,
 }
 
 /// Builder for [`OpenAiProvider`].
@@ -162,6 +165,7 @@ pub struct OpenAiProviderBuilder {
     preserve_thinking_context: bool,
     native_openai: bool,
     stream_timeouts: StreamTimeouts,
+    max_request_bytes: Option<usize>,
 }
 
 impl OpenAiProviderBuilder {
@@ -180,11 +184,17 @@ impl OpenAiProviderBuilder {
             preserve_thinking_context: false,
             native_openai: false,
             stream_timeouts: StreamTimeouts::default(),
+            max_request_bytes: None,
         }
     }
 
     pub fn stream_timeouts(mut self, stream_timeouts: StreamTimeouts) -> Self {
         self.stream_timeouts = stream_timeouts;
+        self
+    }
+
+    pub fn max_request_bytes(mut self, max_request_bytes: Option<usize>) -> Self {
+        self.max_request_bytes = max_request_bytes;
         self
     }
 
@@ -277,6 +287,7 @@ impl OpenAiProviderBuilder {
             native_openai: self.native_openai,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
             stream_timeouts: self.stream_timeouts,
+            max_request_bytes: self.max_request_bytes,
         }
     }
 }
@@ -387,6 +398,7 @@ impl OpenAiProvider {
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
             stream_timeouts: StreamTimeouts::default(),
+            max_request_bytes: None,
         }
     }
 
@@ -718,6 +730,10 @@ impl Provider for OpenAiProvider {
         self.skip_canonical_filtering
     }
 
+    fn max_request_bytes(&self) -> Option<usize> {
+        self.max_request_bytes
+    }
+
     async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
         let configured_limits = self
             .custom_models
@@ -993,7 +1009,8 @@ pub fn from_declarative_config(
         .dynamic_models(config.dynamic_models)
         .skip_canonical_filtering(config.skip_canonical_filtering)
         .preserve_thinking_context(config.preserves_thinking)
-        .stream_timeouts(stream_timeouts))
+        .stream_timeouts(stream_timeouts)
+        .max_request_bytes(config.max_request_bytes))
 }
 
 pub fn parse_custom_headers(s: String) -> HashMap<String, String> {
@@ -1054,6 +1071,7 @@ mod tests {
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
             stream_timeouts: StreamTimeouts::default(),
+            max_request_bytes: None,
         }
     }
 
@@ -1466,6 +1484,7 @@ mod tests {
             timeout_seconds: None,
             stream_chunk_timeout_secs: None,
             stream_first_line_timeout_secs: None,
+            max_request_bytes: None,
             supports_streaming: None,
             requires_auth: false,
             catalog_provider_id: None,
@@ -1514,6 +1533,19 @@ mod tests {
         .build();
 
         assert_eq!(provider.api_client.host(), "http://[::1]:1234");
+    }
+
+    #[test]
+    fn declarative_config_limit_reaches_the_provider() {
+        let mut config = custom_config("http://localhost:1234/v1");
+        assert_eq!(config.clone().max_request_bytes, None);
+
+        config.max_request_bytes = Some(5_000_000);
+        let provider = from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+            .unwrap()
+            .build();
+
+        assert_eq!(provider.max_request_bytes(), Some(5_000_000));
     }
 
     #[test]
@@ -1609,6 +1641,7 @@ mod tests {
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
             stream_timeouts: StreamTimeouts::default(),
+            max_request_bytes: None,
         }
     }
 
