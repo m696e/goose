@@ -95,12 +95,21 @@ fn max_stream_retries() -> u32 {
         .unwrap_or(DEFAULT_MAX_STREAM_RETRIES)
 }
 
-/// Returns `true` for transient provider errors that warrant an automatic
-/// stream retry rather than aborting the turn.
+/// Returns `true` for provider errors that warrant an automatic retry rather
+/// than aborting the turn.
+///
+/// Uses the shared retry classification so both agent loops agree on which
+/// failures are worth another attempt: transport errors, and 4xx that the
+/// policy does not consider permanently malformed — a gateway collapsing its
+/// own routing failure into an opaque 400 is the common case. Rate limits are
+/// excluded: they need the provider's own delay, not this loop's backoff.
 fn should_retry_stream(err: &ProviderError) -> bool {
-    matches!(
+    if matches!(err, ProviderError::RateLimitExceeded { .. }) {
+        return false;
+    }
+    goose_provider_types::retry::should_retry(
         err,
-        ProviderError::NetworkError(_) | ProviderError::ServerError(_)
+        &goose_provider_types::retry::RetryConfig::default(),
     )
 }
 
@@ -390,7 +399,7 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     async fn retry_notice(&self, emit: &Emitter, attempt: u32, max_retries: u32) {
         let notice = Message::assistant().with_system_notification(
             SystemNotificationType::InlineMessage,
-            format!("network interrupted — retrying ({attempt}/{max_retries})…",),
+            format!("request failed — retrying ({attempt}/{max_retries})…",),
         );
         emit.message(notice).await;
     }

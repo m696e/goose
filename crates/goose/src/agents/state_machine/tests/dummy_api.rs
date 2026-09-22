@@ -52,6 +52,14 @@ enum ApiResponse {
         reply: String,
         error: String,
     },
+    /// Fails with HTTP 400 for the first `remaining` matching requests, then
+    /// replies. Lets a test drive the automatic resend path deterministically,
+    /// even though the request body is identical on every attempt.
+    BadRequestTimesThenReply {
+        message: String,
+        remaining: Arc<AtomicUsize>,
+        reply: String,
+    },
 }
 
 #[derive(Clone)]
@@ -360,6 +368,25 @@ impl<'a> ApiRuleBuilder<'a> {
         self.configured(ApiResponse::EmptyServerError)
     }
 
+    /// Fails with a 400 for the first `failures` matching requests, then
+    /// replies with `reply`.
+    pub(super) fn bad_request_times(
+        self,
+        failures: usize,
+        message: impl Into<String>,
+        reply: impl Into<String>,
+    ) -> &'a DummyApi {
+        self.api.add_rule(
+            self.matcher,
+            ApiResponse::BadRequestTimesThenReply {
+                message: message.into(),
+                remaining: Arc::new(AtomicUsize::new(failures)),
+                reply: reply.into(),
+            },
+        );
+        self.api
+    }
+
     fn configured(self, response: ApiResponse) -> ConfiguredResponse<'a> {
         ConfiguredResponse {
             api: self.api,
@@ -552,6 +579,24 @@ impl DummyApiState {
                 sse_response(format!("data: {}\n\n", api_error(message)))
             }
             ApiResponse::EmptyServerError => ResponseTemplate::new(500),
+            ApiResponse::BadRequestTimesThenReply {
+                message,
+                remaining,
+                reply,
+            } => {
+                let failed = remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if failed {
+                    ResponseTemplate::new(400).set_body_json(api_error(message))
+                } else {
+                    sse_response(reply_events(
+                        &meta(reply.chars().count() as i32),
+                        &reply,
+                        None,
+                    ))
+                }
+            }
             ApiResponse::ReplyThenServerError { reply, error } => sse_response(reply_events(
                 &meta(reply.chars().count() as i32),
                 &reply,

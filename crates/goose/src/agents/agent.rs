@@ -90,6 +90,22 @@ const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation..."
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
+/// Automatic resends of a whole turn when the provider call fails with a
+/// retryable error. The provider layer already retries such a failure a few
+/// times with backoff; this is the coarser second layer that keeps a flaky
+/// upstream from ending the turn and asking the user to resend by hand.
+const MAX_PROVIDER_ERROR_RETRIES: u32 = 2;
+
+/// A provider error warrants resending the turn only when the shared retry
+/// policy considers it retryable (transport errors, and 4xx that are not
+/// permanently malformed) and the budget is not spent.
+fn should_resend_turn(error: &ProviderError, attempts: u32) -> bool {
+    attempts < MAX_PROVIDER_ERROR_RETRIES
+        && goose_providers::retry::should_retry(
+            error,
+            &goose_providers::retry::RetryConfig::default(),
+        )
+}
 
 fn provider_creation_error(error: anyhow::Error, context: impl fmt::Display) -> anyhow::Error {
     let message = format!("{context}: {error}");
@@ -2628,6 +2644,8 @@ impl Agent {
             let mut compaction_attempts = 0;
             let mut empty_turn_retries = 0u32;
             let mut retrying_after_empty_turn = false;
+            let mut provider_error_retries = 0u32;
+            let mut retrying_after_provider_error = false;
             let mut last_assistant_text = String::new();
             let mut turn_total_usage = Usage::default();
             let mut goal_check_pending = false;
@@ -2780,6 +2798,8 @@ impl Agent {
                     retrying_after_stop_hook_denial = false;
                 } else if retrying_after_empty_turn {
                     retrying_after_empty_turn = false;
+                } else if retrying_after_provider_error {
+                    retrying_after_provider_error = false;
                 } else {
                     turns_taken += 1;
                 }
@@ -3220,6 +3240,27 @@ impl Agent {
                                 no_tools_called = false;
                             }
                         }
+                        // A retryable failure resends the turn rather than ending
+                        // it with a message the user has to act on. Only when the
+                        // turn produced nothing, so a resent turn cannot duplicate
+                        // output, and bounded by the retry budget. Errors the
+                        // policy calls permanently malformed fall through to the
+                        // arms below and are surfaced instead.
+                        Err(ref provider_err)
+                            if should_resend_turn(provider_err, provider_error_retries)
+                                && no_tools_called
+                                && last_assistant_text.is_empty() =>
+                        {
+                            provider_error_retries += 1;
+                            provider_errored = true;
+                            retrying_after_provider_error = true;
+                            messages_to_add = Conversation::default();
+                            warn!(
+                                "Provider call failed; resending the turn ({}/{}): {:?}",
+                                provider_error_retries, MAX_PROVIDER_ERROR_RETRIES, provider_err
+                            );
+                            break;
+                        }
                         #[allow(unused_variables)]
                         Err(ref provider_err @ ProviderError::ContextLengthExceeded(_)) => {
                             provider_errored = true;
@@ -3389,6 +3430,9 @@ impl Agent {
                 } else {
                     empty_turn_retries = 0;
                 }
+                if !provider_errored {
+                    provider_error_retries = 0;
+                }
 
                 if no_tools_called && !exit_chat {
                     // Lock, extract state, drop guard before branching — handle_retry_logic
@@ -3410,6 +3454,11 @@ impl Agent {
                         Some(Some(output)) => {
                             pending_final_output = Some(output);
                             exit_chat = true;
+                        }
+                        None if retrying_after_provider_error => {
+                            // The provider call failed retryably and the turn is
+                            // being resent; skip the nudges and retry logic that
+                            // would otherwise end it.
                         }
                         None if did_recovery_compact_this_iteration => {
                             // continue from last user message after recovery compact

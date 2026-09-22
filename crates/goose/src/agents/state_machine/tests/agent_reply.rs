@@ -1113,3 +1113,154 @@ async fn emits_tool_call_stage_before_the_tool_request_on_both_loops() -> Result
 
     Ok(())
 }
+
+/// Text a user would read, including provider errors — those travel as `Error`
+/// blocks rather than text, so `as_concat_text` misses them.
+fn rendered_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .map(|content| match content {
+            MessageContent::Text(text) => text.text.clone(),
+            MessageContent::Error(error) => error.message.clone(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A retryable provider failure must resend the turn instead of ending it with
+/// a message the user has to act on. The payload is identical on every attempt,
+/// so the only way to reach the reply is for the agent loop to resend it: the
+/// provider layer alone gives up after its own bounded retries.
+#[tokio::test]
+async fn resends_the_turn_after_a_retryable_provider_error_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_STATE_MACHINE", None::<&str>),
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+        ("GOOSE_INFERENCE_STREAM_RETRIES", Some("2")),
+    ]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        api.on("hello").bad_request_times(
+            6,
+            "Upstream provider returned an error.",
+            "recovered after resending the turn",
+        );
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message) => Some(rendered_text(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Streamed replies arrive in chunks, so compare on collapsed whitespace.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            text.contains("recovered after resending the turn"),
+            "turn should have recovered by resending (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !text.contains("Please retry if you think this is a transient"),
+            "must not ask the user to resend after it already recovered (state_machine={use_state_machine})"
+        );
+        assert!(
+            api.call_count() > 4,
+            "recovery requires more attempts than the provider layer's budget (state_machine={use_state_machine}); \
+             calls={}",
+            api.call_count()
+        );
+    }
+
+    Ok(())
+}
+
+/// The counterpart: a 400 the retry policy classifies as permanently malformed
+/// is rejected once and surfaced, rather than resent.
+#[tokio::test]
+async fn does_not_resend_the_turn_after_a_permanent_provider_error_on_both_loops() -> Result<()> {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_STATE_MACHINE", None::<&str>),
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+    ]);
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        api.on("hello").bad_request_times(
+            100,
+            "The `reasoning_content` in the thinking mode must be passed back to the API.",
+            "should never be reached",
+        );
+
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config,
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message) => Some(rendered_text(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Streamed replies arrive in chunks, so compare on collapsed whitespace.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(
+            api.call_count(),
+            1,
+            "a permanently malformed request must not be resent (state_machine={use_state_machine})"
+        );
+        assert!(
+            text.contains("must be passed back"),
+            "the provider's error must be surfaced (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !text.contains("should never be reached"),
+            "no reply should be produced (state_machine={use_state_machine})"
+        );
+    }
+
+    Ok(())
+}
