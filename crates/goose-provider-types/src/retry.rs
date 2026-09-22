@@ -88,20 +88,44 @@ impl RetryConfig {
 }
 
 /// Substrings marking a `RequestFailed` (4xx) as deterministically permanent:
-/// Anthropic rejects signed `thinking`/`redacted_thinking` blocks as immutable
-/// once a thinking model's config changes mid-conversation, and the identical
+/// the request is rejected because of what it contains, and the identical
 /// payload is rebuilt on every retry — so retrying can never succeed.
+///
+/// Anthropic rejects signed `thinking`/`redacted_thinking` blocks as immutable
+/// once a thinking model's config changes mid-conversation. DeepSeek-family
+/// OpenAI-compatible providers reject a replayed assistant tool-call message
+/// that omits `reasoning_content`. The remaining entries are request-shape rejections
+/// (context size, token budget) that no retry can change.
+///
+/// This is deliberately a *known-permanent* list rather than a
+/// *known-transient* one. Some gateways collapse their own routing failures
+/// into an opaque 400 body (e.g. "Upstream provider returned an error."); the
+/// same payload often succeeds on a later attempt, so an unrecognised 400 must
+/// stay retryable. Classifying by known-permanent bodies is what keeps both
+/// properties.
 const PERMANENT_REQUEST_FAILURE_MARKERS: &[&str] = &[
     "blocks in the latest assistant message cannot be modified",
     "must remain as they were in the original response",
     "Reasoning is mandatory for this endpoint",
+    "thinking mode must be passed back",
+    "cannot be greater than max_model_len",
+    "exceeds the available context size",
 ];
 
 fn is_permanent_request_failure(message: &str) -> bool {
     PERMANENT_REQUEST_FAILURE_MARKERS
         .iter()
         .any(|marker| message.contains(marker))
+        || is_model_not_found(message)
         || crate::formats::anthropic::is_thinking_signature_error(message)
+}
+
+/// `The model 'x' does not exist.` — a bad model name cannot start existing on
+/// retry. Both halves are required so an unrelated "does not exist" in some
+/// other error body stays retryable.
+fn is_model_not_found(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("model") && lower.contains("does not exist")
 }
 
 pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
@@ -308,6 +332,68 @@ mod tests {
         assert!(!is_permanent_request_failure(
             "Bad request (400): model not found"
         ));
+    }
+
+    #[test]
+    fn never_retries_missing_reasoning_content_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): {\"error\":{\"message\":\"The `reasoning_content` in \
+             the thinking mode must be passed back to the API.\",\"type\":\
+             \"invalid_request_error\"}}"
+                .into(),
+        );
+        assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_context_size_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): request (16945 tokens) exceeds the available context \
+             size (8192 tokens), try increasing it"
+                .into(),
+        );
+        assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_max_completion_tokens_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): max_completion_tokens=384000 cannot be greater than \
+             max_model_len=max_total_tokens=32768"
+                .into(),
+        );
+        assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_unknown_model_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): The model 'deepseek-v4.1-pro' does not exist.".into(),
+        );
+        assert!(!should_retry(&error, &config));
+    }
+
+    /// The counterpart to the known-permanent markers: a gateway that collapses
+    /// its own routing failures into an opaque 400 body must stay retryable,
+    /// because the identical payload succeeds on a later attempt.
+    #[test]
+    fn retries_opaque_upstream_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): Upstream provider returned an error.".into(),
+        );
+        assert!(should_retry(&error, &config));
+    }
+
+    #[test]
+    fn model_not_found_needs_both_halves() {
+        assert!(is_model_not_found("The model 'x' does not exist."));
+        assert!(!is_model_not_found("does not exist"));
+        assert!(!is_model_not_found("Bad request (400): model not found"));
     }
 
     #[test]
