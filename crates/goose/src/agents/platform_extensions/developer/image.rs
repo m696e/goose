@@ -13,6 +13,20 @@ use super::edit::resolve_path;
 
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// The largest encoded image the model is given. A gateway that counts request
+/// bytes rather than tokens refuses the whole request over one large
+/// attachment, and base64 inflates a file by a third, so an image above this is
+/// downscaled before it is attached.
+const MAX_ENCODED_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Longest edge an oversized image is reduced to. Vision models shrink images
+/// to about this size themselves, so the model loses nothing it would have seen.
+const DOWNSCALE_LONGEST_EDGE: u32 = 1568;
+
+/// Quality of the re-encoding, high enough that the model cannot tell the
+/// difference at the sizes involved.
+const JPEG_QUALITY: u8 = 85;
+
 fn visible_text(text: impl Into<String>) -> ContentBlock {
     ContentBlock::Text(
         TextContent::new(text).with_annotations(Annotations::default().with_priority(0.0)),
@@ -92,6 +106,7 @@ struct LoadedImage {
     original_width: u32,
     original_height: u32,
     cropped: bool,
+    downscaled: bool,
 }
 
 impl LoadedImage {
@@ -104,9 +119,18 @@ impl LoadedImage {
         } else {
             String::new()
         };
+        let downscale_note = if self.downscaled {
+            format!(
+                " Downscaled from {}x{} to {}x{} to fit the provider's request limit; the detail \
+                 in the original is not available in this image.",
+                self.original_width, self.original_height, self.width, self.height
+            )
+        } else {
+            String::new()
+        };
 
         format!(
-            "Loaded image from {source} ({} bytes, {}, {}x{}).{crop_note}",
+            "Loaded image from {source} ({} bytes, {}, {}x{}).{crop_note}{downscale_note}",
             self.bytes_len, self.mime_type, self.width, self.height
         )
     }
@@ -131,38 +155,163 @@ async fn load_image(
         .map_err(|error| format!("failed to decode image: {error}"))?;
     let (original_width, original_height) = image.dimensions();
 
-    let Some(crop) = &params.crop else {
-        return Ok(LoadedImage {
-            data: base64::prelude::BASE64_STANDARD.encode(&bytes),
-            mime_type: mime_type.to_string(),
-            bytes_len: bytes.len(),
-            width: original_width,
-            height: original_height,
-            original_width,
-            original_height,
-            cropped: false,
-        });
+    let (subject, encoded) = match &params.crop {
+        None => (
+            image,
+            EncodedImage {
+                bytes,
+                mime_type: mime_type.to_string(),
+                width: original_width,
+                height: original_height,
+                cropped: false,
+                downscaled: false,
+            },
+        ),
+        Some(crop) => {
+            validate_crop(crop, original_width, original_height)?;
+            let cropped = image.crop_imm(crop.x, crop.y, crop.width, crop.height);
+            let mut cropped_bytes = Cursor::new(Vec::new());
+            cropped
+                .write_to(&mut cropped_bytes, image::ImageFormat::Png)
+                .map_err(|error| format!("failed to encode cropped image: {error}"))?;
+            let cropped_bytes = cropped_bytes.into_inner();
+            ensure_image_size(cropped_bytes.len() as u64)?;
+            (
+                cropped,
+                EncodedImage {
+                    bytes: cropped_bytes,
+                    mime_type: "image/png".to_string(),
+                    width: crop.width,
+                    height: crop.height,
+                    cropped: true,
+                    downscaled: false,
+                },
+            )
+        }
     };
 
-    validate_crop(crop, original_width, original_height)?;
-    let cropped = image.crop_imm(crop.x, crop.y, crop.width, crop.height);
-    let mut cropped_bytes = Cursor::new(Vec::new());
-    cropped
-        .write_to(&mut cropped_bytes, image::ImageFormat::Png)
-        .map_err(|error| format!("failed to encode cropped image: {error}"))?;
-    let cropped_bytes = cropped_bytes.into_inner();
-    ensure_image_size(cropped_bytes.len() as u64)?;
+    let encoded = shrink_to_budget(&subject, encoded)?;
 
     Ok(LoadedImage {
-        data: base64::prelude::BASE64_STANDARD.encode(&cropped_bytes),
-        mime_type: "image/png".to_string(),
-        bytes_len: cropped_bytes.len(),
-        width: crop.width,
-        height: crop.height,
+        data: base64::prelude::BASE64_STANDARD.encode(&encoded.bytes),
+        mime_type: encoded.mime_type,
+        bytes_len: encoded.bytes.len(),
+        width: encoded.width,
+        height: encoded.height,
         original_width,
         original_height,
-        cropped: true,
+        cropped: encoded.cropped,
+        downscaled: encoded.downscaled,
     })
+}
+
+/// The encoding of an image as it would be attached, before any size check.
+struct EncodedImage {
+    bytes: Vec<u8>,
+    mime_type: String,
+    width: u32,
+    height: u32,
+    cropped: bool,
+    downscaled: bool,
+}
+
+impl std::fmt::Debug for EncodedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedImage")
+            .field("bytes", &self.bytes.len())
+            .field("mime_type", &self.mime_type)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("cropped", &self.cropped)
+            .field("downscaled", &self.downscaled)
+            .finish()
+    }
+}
+
+/// An image whose encoded form would make the request too large is reduced
+/// until it fits, so the model can act on it instead of the request being
+/// refused. When even that is not enough, the error says what to do about it —
+/// the model can crop, downscale, or read something else.
+fn shrink_to_budget(
+    source: &image::DynamicImage,
+    encoded: EncodedImage,
+) -> Result<EncodedImage, String> {
+    if encoded.bytes.len() <= MAX_ENCODED_IMAGE_BYTES {
+        return Ok(encoded);
+    }
+
+    let (mut width, mut height) = (source.width(), source.height());
+    for _ in 0..4 {
+        (width, height) = next_smaller(width, height);
+        if width == 0 || height == 0 {
+            break;
+        }
+        let resized = source.resize_exact(width, height, image::imageops::FilterType::Triangle);
+        let Some(bytes) = encode_smaller(&resized) else {
+            break;
+        };
+        if bytes.len() <= MAX_ENCODED_IMAGE_BYTES {
+            return Ok(EncodedImage {
+                bytes,
+                mime_type: if resized.color().has_alpha() {
+                    "image/png".to_string()
+                } else {
+                    "image/jpeg".to_string()
+                },
+                width,
+                height,
+                cropped: encoded.cropped,
+                downscaled: true,
+            });
+        }
+    }
+
+    Err(format!(
+        "image is too large to send: {} when encoded, and the provider's request limit needs it \
+         under {}. Reading it at {}x{} is not enough. Crop to a smaller region with the `crop` \
+         parameter, or downscale the file first (for example \
+         `magick input.jpg -resize 1200x1200 smaller.jpg`) and read that.",
+        human_size(encoded.bytes.len()),
+        human_size(MAX_ENCODED_IMAGE_BYTES),
+        DOWNSCALE_LONGEST_EDGE,
+        DOWNSCALE_LONGEST_EDGE,
+    ))
+}
+
+/// The next size to try: the long edge capped, or halved when it is already
+/// within the cap.
+fn next_smaller(width: u32, height: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    let target = if longest > DOWNSCALE_LONGEST_EDGE {
+        DOWNSCALE_LONGEST_EDGE
+    } else {
+        longest / 2
+    };
+    if target == 0 {
+        return (0, 0);
+    }
+    let scale = target as f64 / longest as f64;
+    (
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    )
+}
+
+fn encode_smaller(image: &image::DynamicImage) -> Option<Vec<u8>> {
+    let mut bytes = Cursor::new(Vec::new());
+    if image.color().has_alpha() {
+        image.write_to(&mut bytes, image::ImageFormat::Png).ok()?;
+    } else {
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, JPEG_QUALITY);
+        encoder.encode_image(image).ok()?;
+    }
+    Some(bytes.into_inner())
+}
+
+fn human_size(bytes: usize) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
 }
 
 async fn load_image_bytes(source: &str, working_dir: Option<&Path>) -> Result<Vec<u8>, String> {
@@ -528,5 +677,133 @@ mod tests {
         assert_eq!(loaded.mime_type, "image/png");
         assert_eq!(loaded.bytes_len, png.len());
         assert_eq!((loaded.width, loaded.height), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::*;
+    use image::{DynamicImage, RgbImage, RgbaImage};
+
+    /// Noise does not compress, so the encoded size is proportional to the
+    /// pixel count — which is what these tests reason about.
+    fn noisy(width: u32, height: u32) -> DynamicImage {
+        let mut image = RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x.wrapping_mul(2654435761) >> 13) as u8,
+                (y.wrapping_mul(40503) >> 7) as u8,
+                (x ^ y) as u8,
+            ]);
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    fn encoded(image: &DynamicImage) -> EncodedImage {
+        let bytes = encode_smaller(image).expect("encodable");
+        EncodedImage {
+            width: image.width(),
+            height: image.height(),
+            bytes,
+            mime_type: "image/png".to_string(),
+            cropped: false,
+            downscaled: false,
+        }
+    }
+
+    #[test]
+    fn leaves_an_image_that_already_fits_alone() {
+        let image = noisy(64, 64);
+        let original = encoded(&image);
+        let bytes = original.bytes.clone();
+
+        let fitted = shrink_to_budget(&image, original).expect("fits");
+
+        assert!(!fitted.downscaled);
+        assert_eq!(fitted.bytes, bytes);
+        assert_eq!((fitted.width, fitted.height), (64, 64));
+    }
+
+    #[test]
+    fn downscales_an_image_that_would_be_refused() {
+        // ~30 MiB of pixels, well past the encoded budget.
+        let image = noisy(3200, 3200);
+        let original = encoded(&image);
+        assert!(
+            original.bytes.len() > MAX_ENCODED_IMAGE_BYTES,
+            "test image should start oversized: {}",
+            original.bytes.len()
+        );
+
+        let fitted = shrink_to_budget(&image, original).expect("should fit once reduced");
+
+        assert!(fitted.downscaled);
+        assert!(fitted.bytes.len() <= MAX_ENCODED_IMAGE_BYTES);
+        assert!(fitted.width <= DOWNSCALE_LONGEST_EDGE);
+        assert!(fitted.height <= DOWNSCALE_LONGEST_EDGE);
+        assert_eq!(fitted.mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn keeps_an_alpha_channel() {
+        let mut image = RgbaImage::new(3200, 3200);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgba([
+                (x.wrapping_mul(2654435761) >> 13) as u8,
+                (y.wrapping_mul(40503) >> 7) as u8,
+                (x ^ y) as u8,
+                128,
+            ]);
+        }
+        let image = DynamicImage::ImageRgba8(image);
+        let original = encoded(&image);
+
+        let fitted = shrink_to_budget(&image, original).expect("should fit once reduced");
+
+        assert!(fitted.downscaled);
+        assert_eq!(fitted.mime_type, "image/png");
+    }
+
+    #[test]
+    fn tells_the_model_what_to_do_when_reducing_is_not_enough() {
+        // A 1x1 image keeps every attempt above a budget that nothing can meet.
+        let image = noisy(1, 1);
+        let original = EncodedImage {
+            bytes: vec![0u8; MAX_ENCODED_IMAGE_BYTES + 1],
+            mime_type: "image/png".to_string(),
+            width: 1,
+            height: 1,
+            cropped: false,
+            downscaled: false,
+        };
+
+        let error = shrink_to_budget(&image, original).expect_err("cannot fit");
+
+        assert!(error.contains("crop"), "{error}");
+        assert!(error.contains("downscale"), "{error}");
+        assert!(error.contains("MiB"), "{error}");
+    }
+
+    #[test]
+    fn summary_reports_a_downscale() {
+        let loaded = LoadedImage {
+            data: String::new(),
+            mime_type: "image/jpeg".to_string(),
+            bytes_len: 1024,
+            width: 800,
+            height: 600,
+            original_width: 4000,
+            original_height: 3000,
+            cropped: false,
+            downscaled: true,
+        };
+
+        let summary = loaded.summary("/tmp/photo.jpg");
+
+        assert!(
+            summary.contains("Downscaled from 4000x3000 to 800x600"),
+            "{summary}"
+        );
+        assert!(summary.contains("photo.jpg"), "{summary}");
     }
 }
