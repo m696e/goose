@@ -3271,33 +3271,95 @@ impl Agent {
                         // A provider that refuses the request on its size has not
                         // run out of context: the payload is too many bytes, and
                         // only the content can be made smaller. Hand the model a
-                        // description of what to shrink and let it decide, bounded
-                        // so a model that keeps resending the same request does not
-                        // loop forever.
-                        Err(ref provider_err @ ProviderError::RequestTooLarge(ref details))
-                            if request_size_attempts < request_size::MAX_REQUEST_SIZE_ADVISORIES as u32 =>
-                        {
+                        // description of what to shrink and let it decide; when it
+                        // does not shrink it, take the largest content out of the
+                        // request rather than summarizing the whole conversation,
+                        // which would only hide what made the request large.
+                        Err(ref provider_err @ ProviderError::RequestTooLarge(ref details)) => {
                             provider_errored = true;
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             request_size_attempts += 1;
-                            retrying_after_oversized_request = true;
 
                             let limit = self.provider().await?.max_request_bytes();
-                            let advisory =
-                                request_size::oversized_request_message(&conversation, details, limit);
-                            warn!(
-                                "Provider refused the request as too large; asking the model to shrink it ({}/{}): {}",
-                                request_size_attempts, request_size::MAX_REQUEST_SIZE_ADVISORIES, provider_err
-                            );
-                            push_message_with_id(
-                                &mut messages_to_add,
-                                Message::user().with_text(advisory).with_visibility(false, true),
-                            );
+                            if request_size_attempts <= request_size::MAX_REQUEST_SIZE_ADVISORIES as u32 {
+                                retrying_after_oversized_request = true;
+                                let advisory = request_size::oversized_request_message(
+                                    &conversation,
+                                    details,
+                                    limit,
+                                );
+                                warn!(
+                                    "Provider refused the request as too large; asking the model to shrink it ({}/{}): {}",
+                                    request_size_attempts, request_size::MAX_REQUEST_SIZE_ADVISORIES, provider_err
+                                );
+                                push_message_with_id(
+                                    &mut messages_to_add,
+                                    Message::user().with_text(advisory).with_visibility(false, true),
+                                );
+                                yield AgentEvent::Message(
+                                    Message::assistant().with_system_notification(
+                                        SystemNotificationType::InlineMessage,
+                                        "The request exceeded the provider's size limit. Asking the model to reduce it...",
+                                    )
+                                );
+                                break;
+                            }
+
+                            let removed = request_size::messages_to_evict(&conversation);
+                            if request_size_attempts
+                                <= (request_size::MAX_REQUEST_SIZE_ADVISORIES + request_size::MAX_REQUEST_SIZE_EVICTIONS)
+                                    as u32
+                                && !removed.is_empty()
+                            {
+                                retrying_after_oversized_request = true;
+                                warn!(
+                                    "Request still too large; removing {} message(s) from the conversation ({}/{}): {}",
+                                    removed.len(),
+                                    request_size_attempts
+                                        - request_size::MAX_REQUEST_SIZE_ADVISORIES as u32,
+                                    request_size::MAX_REQUEST_SIZE_EVICTIONS,
+                                    provider_err
+                                );
+                                for evicted in &removed {
+                                    session_manager
+                                        .update_message_metadata(
+                                            &session_config.id,
+                                            &evicted.id,
+                                            |metadata| metadata.with_agent_invisible(),
+                                        )
+                                        .await?;
+                                }
+                                for message in conversation.messages_mut() {
+                                    if message.id.as_ref().is_some_and(|id| {
+                                        removed.iter().any(|evicted| &evicted.id == id)
+                                    }) {
+                                        message.metadata.agent_visible = false;
+                                    }
+                                }
+                                push_message_with_id(
+                                    &mut messages_to_add,
+                                    Message::user()
+                                        .with_text(request_size::eviction_message(&removed))
+                                        .with_visibility(false, true),
+                                );
+                                yield AgentEvent::Message(
+                                    Message::assistant().with_system_notification(
+                                        SystemNotificationType::InlineMessage,
+                                        "The request was still too large. Removed the largest content so the conversation can continue...",
+                                    )
+                                );
+                                break;
+                            }
+
+                            // Nothing left to remove, or the budget is spent.
+                            error!("Request is too large to send: {}", provider_err);
                             yield AgentEvent::Message(
-                                Message::assistant().with_system_notification(
-                                    SystemNotificationType::InlineMessage,
-                                    "The request exceeded the provider's size limit. Asking the model to reduce it...",
+                                Message::assistant().with_text(
+                                    format!(
+                                        "Ran into this error: {provider_err}.\n\n\
+                                         Please retry if you think this is a transient or recoverable error."
+                                    )
                                 )
                             );
                             break;

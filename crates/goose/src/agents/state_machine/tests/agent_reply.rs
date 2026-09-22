@@ -1428,3 +1428,119 @@ async fn gives_up_on_a_request_that_stays_too_large_on_both_loops() -> Result<()
 
     Ok(())
 }
+
+/// When the model does not shrink the request itself, goose takes the largest
+/// message out of it — it does not summarize the conversation, which would only
+/// hide what made the request large.
+#[tokio::test]
+async fn evicts_the_largest_message_when_the_model_does_not_shrink_the_request_on_both_loops(
+) -> Result<()> {
+    let _guard = env_lock::lock_env([
+        ("GOOSE_STATE_MACHINE", None::<&str>),
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+    ]);
+
+    // Large enough to be worth evicting, small enough that the harness's own
+    // context-limit guard stays out of the way.
+    const SENTINEL: &str = "end-of-the-oversized-message";
+    let oversized = format!("bigmarker {}{SENTINEL}", "x".repeat(80 * 1024));
+
+    for use_state_machine in [false, true] {
+        let (agent, api, session_id, _temp_dir) = agent_with_dummy_api().await?;
+        // Last rule added wins, so the turn under test takes the "hello" rule
+        // while the first turn only matches the oversized message.
+        api.on("bigmarker").reply("ok");
+        api.on("hello").payload_too_large_times(
+            3,
+            "Request body is too large",
+            "recovered after dropping the content",
+        );
+
+        let session_config = |id: String| SessionConfig {
+            id,
+            schedule_id: None,
+            max_turns: Some(8),
+            retry_config: None,
+        };
+
+        let mut first = agent
+            .reply(
+                Message::user().with_text(oversized.clone()),
+                session_config(session_id.clone()),
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+        while let Some(event) = first.next().await {
+            event?;
+        }
+
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("hello"),
+                session_config(session_id),
+                use_state_machine,
+                Some(CancellationToken::new()),
+            )
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message) => Some(rendered_text(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            text.contains("recovered after dropping the content"),
+            "the turn should recover once the largest content is gone \
+             (state_machine={use_state_machine}); got: {text}"
+        );
+        assert!(
+            !compacted(&api),
+            "a request that is too large must not be compacted \
+             (state_machine={use_state_machine})"
+        );
+
+        let calls = api.calls();
+        let told = calls
+            .iter()
+            .any(|call| call.input_contains("goose removed"));
+        assert!(
+            told,
+            "the model must be told the content was removed \
+             (state_machine={use_state_machine})"
+        );
+        let before = calls
+            .iter()
+            .position(|call| call.input_contains("goose removed"))
+            .expect("eviction notice");
+        assert!(
+            calls[..=before]
+                .iter()
+                .any(|call| call.input_contains(SENTINEL)),
+            "the oversized message should have been sent before eviction \
+             (state_machine={use_state_machine})"
+        );
+        // The eviction notice quotes only the first line of what it removed, so
+        // the sentinel at the end of the message proves the body is gone.
+        assert!(
+            !calls[before + 1..]
+                .iter()
+                .any(|call| call.input_contains(SENTINEL)),
+            "the request after eviction must no longer carry the oversized content \
+             (state_machine={use_state_machine}); calls={}",
+            calls.len()
+        );
+    }
+
+    Ok(())
+}

@@ -12,8 +12,8 @@ use async_trait::async_trait;
 
 use crate::agents::request_size;
 use crate::agents::state_machine::{
-    applied, messages_since_kickoff, not_applicable, trailing_error, Emitter, GooseEffect,
-    Operation, OperationResult,
+    applied, messages_since_kickoff, not_applicable, trailing_error, ConversationEffect, Emitter,
+    GooseEffect, Operation, OperationResult,
 };
 use crate::conversation::message::{Message, MessageErrorKind, SystemNotificationType};
 use crate::conversation::Conversation;
@@ -68,40 +68,91 @@ impl Operation<Session, GooseEffect> for RequestSizeOperation {
         };
 
         let messages = messages_since_kickoff(conversation)?;
-        if self.advisories(messages) > request_size::MAX_REQUEST_SIZE_ADVISORIES {
-            // The budget is spent: let the error surface rather than asking
-            // again, so a model that keeps resending the same request cannot
-            // hold the turn open.
-            return not_applicable();
+        if self.advisories(messages) <= request_size::MAX_REQUEST_SIZE_ADVISORIES {
+            let details = conversation
+                .last()
+                .and_then(|message| {
+                    message
+                        .content
+                        .iter()
+                        .find_map(|content| content.as_error().map(|error| error.message.clone()))
+                })
+                .unwrap_or_default();
+
+            tracing::warn!(
+                "Provider refused the request as too large; asking the model to shrink it: {details}"
+            );
+
+            let advisory = Message::user()
+                .with_text(request_size::oversized_request_message(
+                    conversation,
+                    &details,
+                    self.provider.max_request_bytes(),
+                ))
+                .with_visibility(false, true);
+            let notice = Message::assistant().with_system_notification(
+                SystemNotificationType::InlineMessage,
+                "The request exceeded the provider's size limit. Asking the model to reduce it...",
+            );
+
+            emit.message(notice).await;
+            let advisory = emit.message(advisory).await;
+            return applied([advisory.into()]);
         }
 
-        let details = conversation
-            .last()
-            .and_then(|message| {
+        // The model did not shrink the request itself. Take the largest content
+        // out of it rather than summarizing the conversation, which would only
+        // hide what made the request large and send the model looking for it
+        // again.
+        let evictions = messages
+            .iter()
+            .filter(|message| message.is_agent_visible())
+            .filter(|message| {
                 message
                     .content
                     .iter()
-                    .find_map(|content| content.as_error().map(|error| error.message.clone()))
+                    .filter_map(|content| content.as_text())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .starts_with(request_size::EVICTION_NOTICE_PREFIX)
             })
-            .unwrap_or_default();
+            .count();
+        if evictions >= request_size::MAX_REQUEST_SIZE_EVICTIONS {
+            return not_applicable();
+        }
+
+        let removed = request_size::messages_to_evict(conversation);
+        if removed.is_empty() {
+            return not_applicable();
+        }
 
         tracing::warn!(
-            "Provider refused the request as too large; asking the model to shrink it: {details}"
+            "Request is still too large; removing {} message(s) from the conversation",
+            removed.len()
         );
 
-        let advisory = Message::user()
-            .with_text(request_size::oversized_request_message(
-                conversation,
-                &details,
-                self.provider.max_request_bytes(),
-            ))
-            .with_visibility(false, true);
-        let notice = Message::assistant().with_system_notification(
+        let mut effects: Vec<GooseEffect> = removed
+            .iter()
+            .map(|evicted| {
+                ConversationEffect::SetMessageVisibility {
+                    message_id: evicted.id.clone(),
+                    user_visible: true,
+                    agent_visible: false,
+                }
+                .into()
+            })
+            .collect();
+
+        emit.message(Message::assistant().with_system_notification(
             SystemNotificationType::InlineMessage,
-            "The request exceeded the provider's size limit. Asking the model to reduce it...",
-        );
+            "The request was still too large. Removed the largest content so the conversation can continue...",
+        ))
+        .await;
 
-        emit.message(notice).await;
-        applied([advisory.into()])
+        let eviction = Message::user()
+            .with_text(request_size::eviction_message(&removed))
+            .with_visibility(false, true);
+        effects.push(eviction.into());
+        applied(effects)
     }
 }
