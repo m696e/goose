@@ -19,6 +19,7 @@ use crate::agents::state_machine::{
     applied, not_applicable, Emitter, GooseEffect, Operation, OperationResult,
 };
 use crate::context_mgmt::compact_messages;
+use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::providers::base::Provider;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
@@ -56,8 +57,8 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
         // A request that arrived while the capability was denied: the user is
         // told once, then it is dropped.
         if let Some(denied) = state.denied_compaction.take() {
-            emit.message(denied_notice(&denied)).await;
-            return Self::persist(session, state).await;
+            let notice = emit.message(denied_notice(&denied)).await;
+            return Self::persist(session, state, notice).await;
         }
 
         let Some(request) = state.take_pending() else {
@@ -67,12 +68,12 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
         match decide(session, conversation) {
             CompactionDecision::Denied => {
                 state.defer_denied(request.clone());
-                emit.message(denied_notice(&request)).await;
-                Self::persist(session, state).await
+                let notice = emit.message(denied_notice(&request)).await;
+                Self::persist(session, state, notice).await
             }
             CompactionDecision::Refused(detail) => {
-                emit.message(refusal_message(&detail)).await;
-                Self::persist(session, state).await
+                let notice = emit.message(refusal_message(&detail)).await;
+                Self::persist(session, state, notice).await
             }
             CompactionDecision::Apply => {
                 let before = conversation.clone();
@@ -106,13 +107,14 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                             before_tokens,
                             Some(result.retained_context_tokens),
                         );
-                        emit.message(applied_notice(
-                            &request,
-                            before_tokens,
-                            Some(result.retained_context_tokens),
-                            event.archived_message_count(),
-                        ))
-                        .await;
+                        let notice = emit
+                            .message(applied_notice(
+                                &request,
+                                before_tokens,
+                                Some(result.retained_context_tokens),
+                                event.archived_message_count(),
+                            ))
+                            .await;
                         state.mark_applied(&request);
 
                         let mut extension_data = session.extension_data.clone();
@@ -124,15 +126,17 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                                 event,
                             },
                             GooseEffect::SetExtensionData(extension_data),
+                            notice.into(),
                         ])
                     }
                     Err(error) => {
                         span.record("error.type", "compaction_error");
-                        emit.message(refusal_message(&format!(
-                            "compaction failed ({error}); ask again if you still need it"
-                        )))
-                        .await;
-                        Self::persist(session, state).await
+                        let notice = emit
+                            .message(refusal_message(&format!(
+                                "compaction failed ({error}); ask again if you still need it"
+                            )))
+                            .await;
+                        Self::persist(session, state, notice).await
                     }
                 }
             }
@@ -141,12 +145,15 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
 }
 
 impl SessionRequestOperation {
+    /// Clearing a request and telling someone about it go together: the notice
+    /// is part of the outcome, so it is persisted rather than only streamed.
     async fn persist(
         session: &Session,
         state: SessionRequestState,
+        notice: Message,
     ) -> Result<OperationResult<GooseEffect>> {
         let mut extension_data = session.extension_data.clone();
         state.write_into(&mut extension_data)?;
-        applied([GooseEffect::SetExtensionData(extension_data)])
+        applied([GooseEffect::SetExtensionData(extension_data), notice.into()])
     }
 }

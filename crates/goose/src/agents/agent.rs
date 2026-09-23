@@ -3366,6 +3366,7 @@ impl Agent {
                                         )
                                         .await?;
                                 }
+                                let before_eviction = conversation.clone();
                                 for message in conversation.messages_mut() {
                                     if message.id.as_ref().is_some_and(|id| {
                                         removed.iter().any(|evicted| &evicted.id == id)
@@ -3373,6 +3374,25 @@ impl Agent {
                                         message.metadata.agent_visible = false;
                                     }
                                 }
+                                // Eviction takes content away without replacing the
+                                // conversation, so it records its own archive event
+                                // and the history it removed stays legible.
+                                let eviction_event = CompactionEvent::new(
+                                    CompactionTrigger::Eviction,
+                                    Some(
+                                        "the request exceeded the provider's size limit"
+                                            .to_string(),
+                                    ),
+                                    &before_eviction,
+                                    &conversation,
+                                    session.usage.total_tokens,
+                                    crate::context_mgmt::count_context_tokens(conversation.messages())
+                                        .await
+                                        .ok(),
+                                );
+                                session_manager
+                                    .record_archive_event(&session_config.id, &eviction_event)
+                                    .await?;
                                 push_message_with_id(
                                     &mut messages_to_add,
                                     Message::user()

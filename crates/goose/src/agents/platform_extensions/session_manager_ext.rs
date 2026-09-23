@@ -118,7 +118,7 @@ impl SessionManagerClient {
 
         match (used, context_limit) {
             (Some(used), Some(limit)) if limit > 0 => lines.push(format!(
-                "context: {used} / {limit} tokens ({:.0}%) as of the last request",
+                "context: {used} / {limit} tokens ({:.0}%) as of the last request; that is the whole request, including the system prompt and tool definitions",
                 (used as f64 / limit as f64) * 100.0
             )),
             (Some(used), _) => lines.push(format!(
@@ -127,13 +127,16 @@ impl SessionManagerClient {
             _ => lines.push("context: not reported by the provider yet".to_string()),
         }
 
-        if let (Some(counted), Some(limit)) = (counted, context_limit) {
-            if limit > 0 {
-                lines.push(format!(
-                    "counted now: ~{counted} tokens ({:.0}%)",
-                    (counted as f64 / limit as f64) * 100.0
-                ));
-            }
+        if let Some(counted) = counted {
+            let share = match context_limit {
+                Some(limit) if limit > 0 => {
+                    format!(" ({:.0}%)", (counted as f64 / limit as f64) * 100.0)
+                }
+                _ => String::new(),
+            };
+            lines.push(format!(
+                "conversation: ~{counted} tokens{share} counted now; messages alone, excluding the system prompt and tool definitions"
+            ));
         }
 
         if auto_compaction_enabled {
@@ -412,6 +415,30 @@ mod tests {
         assert!(status.contains("messages: 1 visible to you, 1 on record"));
         assert!(status.contains("archived: nothing yet"));
         assert!(status.contains("session-modification: denied"));
+        // The provider's number covers the whole request; the estimate does not,
+        // and the output says so rather than showing two unlabelled numbers.
+        assert!(status.contains("conversation: ~"));
+        assert!(status.contains("messages alone, excluding the system prompt and tool definitions"));
+    }
+
+    #[tokio::test]
+    async fn status_separates_the_request_total_from_the_conversation_estimate() {
+        let (session, manager, _tmp) = session_with_history().await;
+        manager
+            .update(&session.id)
+            .model_config(goose_providers::model::ModelConfig::new("some-model"))
+            .apply()
+            .await
+            .unwrap();
+        let client = client(&manager, &session);
+
+        let status = client.session_status(&session.id).await.unwrap();
+
+        // Without a provider the limit is unknown, but the two numbers are still
+        // labelled so they cannot be read as the same measurement.
+        assert!(status.contains("as of the last request"));
+        assert!(status.contains("conversation: ~"));
+        assert!(status.contains("excluding the system prompt and tool definitions"));
     }
 
     #[tokio::test]

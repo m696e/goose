@@ -27,7 +27,7 @@ use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
 use crate::permission::Permission;
 use crate::providers::base::Provider;
-use crate::session::{SessionManager, SessionType};
+use crate::session::{CompactionTrigger, SessionManager, SessionType};
 use goose_providers::model::ModelConfig;
 
 async fn agent_with_dummy_api() -> Result<(Agent, Arc<DummyApi>, String, tempfile::TempDir)> {
@@ -1478,7 +1478,7 @@ async fn evicts_the_largest_message_when_the_model_does_not_shrink_the_request_o
         let mut stream = agent
             .reply(
                 Message::user().with_text("hello"),
-                session_config(session_id),
+                session_config(session_id.clone()),
                 use_state_machine,
                 Some(CancellationToken::new()),
             )
@@ -1508,6 +1508,22 @@ async fn evicts_the_largest_message_when_the_model_does_not_shrink_the_request_o
             !compacted(&api),
             "a request that is too large must not be compacted \
              (state_machine={use_state_machine})"
+        );
+
+        // Taking content away is recorded, not just done: the session has to be
+        // able to explain what happened to history later.
+        let recorded = agent
+            .config
+            .session_manager
+            .list_compaction_events(&session_id)
+            .await?;
+        assert!(
+            recorded
+                .iter()
+                .any(|stored| stored.event.trigger == CompactionTrigger::Eviction
+                    && !stored.event.archived_message_ids.is_empty()),
+            "the eviction must be recorded as archive history \
+             (state_machine={use_state_machine}); recorded: {recorded:?}"
         );
 
         let calls = api.calls();

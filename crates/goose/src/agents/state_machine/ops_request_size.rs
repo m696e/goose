@@ -18,6 +18,7 @@ use crate::agents::state_machine::{
 use crate::conversation::message::{Message, MessageErrorKind, SystemNotificationType};
 use crate::conversation::Conversation;
 use crate::providers::base::Provider;
+use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
 use crate::session::Session;
 
 pub struct RequestSizeOperation {
@@ -55,7 +56,7 @@ impl Operation<Session, GooseEffect> for RequestSizeOperation {
 
     async fn run(
         &self,
-        _session: &Session,
+        session: &Session,
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
@@ -153,6 +154,32 @@ impl Operation<Session, GooseEffect> for RequestSizeOperation {
             .with_text(request_size::eviction_message(&removed))
             .with_visibility(false, true);
         effects.push(eviction.into());
+
+        // Eviction takes content away from the agent without replacing the
+        // conversation, so it records its own archive event: the history it
+        // removed has to stay legible to whoever inspects the session later.
+        let mut after = conversation.clone();
+        for message in after.messages_mut() {
+            if message
+                .id
+                .as_ref()
+                .is_some_and(|id| removed.iter().any(|evicted| &evicted.id == id))
+            {
+                message.metadata.agent_visible = false;
+            }
+        }
+        let event = CompactionEvent::new(
+            CompactionTrigger::Eviction,
+            Some("the request exceeded the provider's size limit".to_string()),
+            conversation,
+            &after,
+            session.usage.total_tokens,
+            crate::context_mgmt::count_context_tokens(after.messages())
+                .await
+                .ok(),
+        );
+        effects.push(GooseEffect::RecordArchiveEvent(event));
+
         applied(effects)
     }
 }

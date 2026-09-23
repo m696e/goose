@@ -1,9 +1,9 @@
 //! A record of every time a session's history was taken away from the agent.
 //!
-//! Compaction and clearing do not delete messages: the stored rows stay, with
-//! `agent_visible` turned off. These records say when that happened, why, and
-//! which messages it affected, so the archive can be told apart from the
-//! messages that were never part of a conversation.
+//! Compaction, clearing and eviction do not delete messages: the stored rows
+//! stay, with `agent_visible` turned off. These records say when that happened,
+//! why, and which messages it affected, so the archive can be told apart from
+//! the messages that were never part of a conversation.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -24,6 +24,8 @@ pub enum CompactionTrigger {
     Model,
     /// The user ran /clear.
     Clear,
+    /// A request was refused for its size and goose removed the largest content.
+    Eviction,
 }
 
 impl CompactionTrigger {
@@ -34,6 +36,7 @@ impl CompactionTrigger {
             Self::Manual => "manual",
             Self::Model => "model",
             Self::Clear => "clear",
+            Self::Eviction => "eviction",
         }
     }
 
@@ -44,6 +47,7 @@ impl CompactionTrigger {
             "manual" => Some(Self::Manual),
             "model" => Some(Self::Model),
             "clear" => Some(Self::Clear),
+            "eviction" => Some(Self::Eviction),
             _ => None,
         }
     }

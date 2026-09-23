@@ -668,6 +668,12 @@ impl SessionManager {
         self.storage.list_compaction_events(id).await
     }
 
+    /// Record that messages were taken away from the agent without replacing the
+    /// conversation, as eviction does.
+    pub async fn record_archive_event(&self, id: &str, event: &CompactionEvent) -> Result<()> {
+        self.storage.record_archive_event(id, event).await
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.storage.list_sessions().await
     }
@@ -2493,6 +2499,14 @@ impl SessionStorage {
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn record_archive_event(&self, session_id: &str, event: &CompactionEvent) -> Result<()> {
+        let pool = self.pool().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::insert_compaction_event(&mut tx, session_id, event).await?;
         tx.commit().await?;
         Ok(())
     }

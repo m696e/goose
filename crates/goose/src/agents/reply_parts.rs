@@ -826,7 +826,10 @@ impl Agent {
 
         if let Some(denied) = state.denied_compaction.take() {
             state.persist(session_manager, session_id).await?;
-            return Ok(Some(denied_notice(&denied)));
+            return Ok(Some(
+                self.persist_notice(session_manager, session_id, denied_notice(&denied))
+                    .await?,
+            ));
         }
 
         let Some(request) = state.take_pending() else {
@@ -837,11 +840,17 @@ impl Agent {
             CompactionDecision::Denied => {
                 state.defer_denied(request.clone());
                 state.persist(session_manager, session_id).await?;
-                Ok(Some(denied_notice(&request)))
+                Ok(Some(
+                    self.persist_notice(session_manager, session_id, denied_notice(&request))
+                        .await?,
+                ))
             }
             CompactionDecision::Refused(detail) => {
                 state.persist(session_manager, session_id).await?;
-                Ok(Some(refusal_message(&detail)))
+                Ok(Some(
+                    self.persist_notice(session_manager, session_id, refusal_message(&detail))
+                        .await?,
+                ))
             }
             CompactionDecision::Apply => {
                 let provider = self.provider().await?;
@@ -881,22 +890,49 @@ impl Agent {
                         state.mark_applied(&request);
                         state.persist(session_manager, session_id).await?;
                         *conversation = compacted;
-                        Ok(Some(applied_notice(
-                            &request,
-                            before_tokens,
-                            Some(result.retained_context_tokens),
-                            event.archived_message_count(),
-                        )))
+                        Ok(Some(
+                            self.persist_notice(
+                                session_manager,
+                                session_id,
+                                applied_notice(
+                                    &request,
+                                    before_tokens,
+                                    Some(result.retained_context_tokens),
+                                    event.archived_message_count(),
+                                ),
+                            )
+                            .await?,
+                        ))
                     }
                     Err(error) => {
                         state.persist(session_manager, session_id).await?;
-                        Ok(Some(refusal_message(&format!(
-                            "compaction failed ({error}); ask again if you still need it"
-                        ))))
+                        Ok(Some(
+                            self.persist_notice(
+                                session_manager,
+                                session_id,
+                                refusal_message(&format!(
+                                    "compaction failed ({error}); ask again if you still need it"
+                                )),
+                            )
+                            .await?,
+                        ))
                     }
                 }
             }
         }
+    }
+
+    /// Notices are yielded to the client and recorded, so a resumed session can
+    /// still explain why history did or did not change.
+    async fn persist_notice(
+        &self,
+        session_manager: &Arc<crate::session::SessionManager>,
+        session_id: &str,
+        notice: Message,
+    ) -> Result<Message> {
+        let notice = notice.with_generated_id_if_missing();
+        session_manager.add_message(session_id, &notice).await?;
+        Ok(notice)
     }
 
     fn resolve_chunk_cost(

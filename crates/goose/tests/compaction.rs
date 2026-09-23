@@ -546,6 +546,30 @@ fn notifications_of(events: &[AgentEvent]) -> String {
         .join("\n")
 }
 
+/// The notices stored in a session, which is where they have to be for a
+/// resumed session to explain what happened to history.
+async fn stored_notices(agent: &Agent, session: &Session) -> String {
+    use goose::conversation::message::MessageContentBlock;
+
+    agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await
+        .unwrap()
+        .conversation
+        .unwrap()
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|content| match content {
+            MessageContentBlock::SystemNotification(notification) => Some(notification.msg.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn set_pending_compaction_request(
     agent: &Agent,
     session: &Session,
@@ -618,6 +642,12 @@ async fn a_denied_compaction_request_is_reported_and_changes_nothing() -> Result
     assert!(notices.contains("the logs are no longer needed"));
     assert!(notices.contains("/permit session-modification"));
 
+    let on_record = stored_notices(&agent, &session).await;
+    assert!(
+        on_record.contains("goose asked to compact this conversation"),
+        "the notice must be on record, not only on screen"
+    );
+
     assert!(agent
         .config
         .session_manager
@@ -663,6 +693,12 @@ async fn a_permitted_compaction_request_compacts_at_the_next_boundary() -> Resul
     let notices = notifications_of(&events);
     assert!(notices.contains("Compacted at goose's request"));
     assert!(notices.contains("the first exchange is done"));
+
+    let on_record = stored_notices(&agent, &session).await;
+    assert!(
+        on_record.contains("Compacted at goose's request"),
+        "the notice must be on record, not only on screen"
+    );
 
     let recorded = agent
         .config

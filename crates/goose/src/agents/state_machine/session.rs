@@ -108,6 +108,9 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
                     })
                     .await?;
                 }
+                GooseEffect::RecordArchiveEvent(event) => {
+                    self.record_archive_event(&session.id, event).await?;
+                }
                 GooseEffect::SetRecipe(recipe) => {
                     self.update(&session.id)
                         .recipe(recipe.as_ref().clone())
