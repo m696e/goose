@@ -271,6 +271,32 @@ impl GooseCompleter {
         Ok((line.len(), vec![]))
     }
 
+    /// Complete the capability names of /permit and /deny
+    fn complete_capability_names(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let candidates = goose::capabilities::capability_names();
+        let partial = if line.ends_with(' ') {
+            ""
+        } else {
+            line.split_whitespace().last().unwrap_or("")
+        };
+
+        let matching: Vec<Pair> = candidates
+            .iter()
+            .filter(|name| name.starts_with(partial))
+            .map(|name| Pair {
+                display: name.to_string(),
+                replacement: name.to_string(),
+            })
+            .collect();
+
+        let pos = if partial.is_empty() {
+            line.len()
+        } else {
+            line.len() - partial.len()
+        };
+        Ok((pos, matching))
+    }
+
     /// Complete argument keys for a specific prompt
     fn complete_argument_keys(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
         let parts: Vec<&str> = line.get(8..).unwrap_or("").split_whitespace().collect();
@@ -497,6 +523,10 @@ impl Completer for GooseCompleter {
                 return self.complete_skill_names(line);
             }
 
+            if line.starts_with("/permit ") || line.starts_with("/deny ") {
+                return self.complete_capability_names(line);
+            }
+
             return Ok((pos, vec![]));
         }
 
@@ -655,6 +685,26 @@ mod tests {
             .insert("zai".to_string(), vec!["glm-4.5".to_string()]);
 
         Arc::new(RwLock::new(cache))
+    }
+
+    #[test]
+    fn test_complete_capability_names() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (pos, candidates) = completer.complete_capability_names("/permit ").unwrap();
+        assert_eq!(pos, "/permit ".len());
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display == "session-modification"));
+
+        let (_, candidates) = completer
+            .complete_capability_names("/permit session")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        let (_, candidates) = completer.complete_capability_names("/deny nope").unwrap();
+        assert!(candidates.is_empty());
     }
 
     #[test]

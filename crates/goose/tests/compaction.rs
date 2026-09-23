@@ -688,6 +688,100 @@ async fn status_and_archive_report_the_archived_history() -> Result<()> {
 }
 
 #[tokio::test]
+async fn permit_and_deny_are_the_only_way_to_grant_a_session_capability() -> Result<()> {
+    use goose::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "capability-gate",
+        vec![Message::user().with_id("m1").with_text("Remember this")],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    async fn granted(agent: &Agent, id: &str) -> bool {
+        let session = agent
+            .config
+            .session_manager
+            .get_session(id, false)
+            .await
+            .unwrap();
+        SessionPermissions::read(&session.extension_data).is_granted(SESSION_MODIFICATION)
+    }
+
+    let listing = text_of(&run_command(&agent, &session, "/permit").await?);
+    assert!(listing.contains("session-modification"));
+    assert!(listing.contains("[denied]"));
+    assert!(!granted(&agent, &session.id).await);
+
+    let unknown = text_of(&run_command(&agent, &session, "/permit nonsense").await?);
+    assert!(unknown.contains("is not a capability"));
+
+    let granted_text =
+        text_of(&run_command(&agent, &session, "/permit session-modification").await?);
+    assert!(granted_text.contains("`session-modification` is permitted for this session"));
+    assert!(granted(&agent, &session.id).await);
+
+    let again = text_of(&run_command(&agent, &session, "/permit session-modification").await?);
+    assert!(again.contains("already in effect"));
+
+    let denied_text = text_of(&run_command(&agent, &session, "/deny session-modification").await?);
+    assert!(denied_text.contains("`session-modification` is denied for this session"));
+    assert!(!granted(&agent, &session.id).await);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn grants_do_not_leak_into_another_session() -> Result<()> {
+    use goose::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let first = setup_test_session(
+        &agent,
+        &temp_dir,
+        "granted-session",
+        vec![Message::user().with_id("m1").with_text("Remember this")],
+    )
+    .await?;
+    let second = setup_test_session(
+        &agent,
+        &temp_dir,
+        "other-session",
+        vec![Message::user().with_id("m1").with_text("Remember this")],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &first.id,
+        )
+        .await?;
+
+    run_command(&agent, &first, "/permit session-modification").await?;
+
+    let other = agent
+        .config
+        .session_manager
+        .get_session(&second.id, false)
+        .await?;
+    assert!(!SessionPermissions::read(&other.extension_data).is_granted(SESSION_MODIFICATION));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_auto_compaction_during_reply() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let agent = Agent::new();

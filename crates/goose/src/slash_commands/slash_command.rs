@@ -68,7 +68,7 @@ mod tests {
             names,
             vec![
                 "prompts", "prompt", "compact", "clear", "skills", "doctor", "goal", "grind",
-                "status", "archive"
+                "status", "archive", "permit", "deny"
             ]
         );
         assert!(commands

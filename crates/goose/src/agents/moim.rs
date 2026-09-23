@@ -72,7 +72,19 @@ pub(super) async fn compute_compaction_info(
     let compaction_threshold = crate::config::Config::global()
         .get_param::<f64>("GOOSE_AUTO_COMPACT_THRESHOLD")
         .unwrap_or(crate::context_mgmt::DEFAULT_COMPACTION_THRESHOLD);
-    compaction_remaining_line(total_tokens, context_limit, compaction_threshold)
+    let session_permitted = session
+        .as_ref()
+        .map(|session| {
+            crate::capabilities::SessionPermissions::read(&session.extension_data)
+                .is_granted(crate::capabilities::SESSION_MODIFICATION)
+        })
+        .unwrap_or(false);
+    compaction_remaining_line(
+        total_tokens,
+        context_limit,
+        compaction_threshold,
+        session_permitted,
+    )
 }
 
 pub async fn turn_context_message(
@@ -200,6 +212,7 @@ fn compaction_remaining_line(
     total_tokens: Option<i32>,
     context_limit: Option<usize>,
     threshold: f64,
+    session_modification_permitted: bool,
 ) -> Option<String> {
     let total_tokens = total_tokens?;
     let context_limit = context_limit?;
@@ -213,10 +226,16 @@ fn compaction_remaining_line(
         return None;
     }
 
-    Some(format!(
+    let mut line = format!(
         "~{}k tokens remaining",
         compaction_at.saturating_sub(total_tokens) / 1000
-    ))
+    );
+    if !session_modification_permitted {
+        line.push_str(
+            " (you cannot compact this session yourself; the user can run /permit session-modification)",
+        );
+    }
+    Some(line)
 }
 
 fn turn_budget_part(turns_taken: u32, max_turns: u32) -> Option<String> {
@@ -322,6 +341,16 @@ mod tests {
         let text = message.content[0].as_text().unwrap();
         assert!(text.starts_with(&format!("<{TURN_CONTEXT_TAG}>\n")));
         assert!(text.trim_end().ends_with(&format!("</{TURN_CONTEXT_TAG}>")));
+    }
+
+    #[test]
+    fn the_compaction_line_names_the_permission_when_it_is_denied() {
+        let denied = compaction_remaining_line(Some(70_000), Some(100_000), 0.8, false).unwrap();
+        assert!(denied.contains("~10k tokens remaining"));
+        assert!(denied.contains("/permit session-modification"));
+
+        let permitted = compaction_remaining_line(Some(70_000), Some(100_000), 0.8, true).unwrap();
+        assert_eq!(permitted, "~10k tokens remaining");
     }
 
     #[tokio::test]

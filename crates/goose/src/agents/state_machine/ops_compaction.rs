@@ -29,6 +29,7 @@ fn compaction_part(
     total_tokens: Option<i32>,
     context_limit: usize,
     threshold: f64,
+    session_modification_permitted: bool,
 ) -> Option<String> {
     let total_tokens = total_tokens?;
     if total_tokens <= 0 || context_limit == 0 || threshold <= 0.0 || threshold >= 1.0 {
@@ -40,10 +41,16 @@ fn compaction_part(
         return None;
     }
 
-    Some(format!(
-        "<compaction>~{}k tokens remaining</compaction>",
+    let mut line = format!(
+        "~{}k tokens remaining",
         compaction_at.saturating_sub(total_tokens) / 1000
-    ))
+    );
+    if !session_modification_permitted {
+        line.push_str(
+            " (you cannot compact this session yourself; the user can run /permit session-modification)",
+        );
+    }
+    Some(format!("<compaction>{line}</compaction>"))
 }
 
 /// Reported usage stops at the inference that requested the tools, so the
@@ -248,10 +255,13 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
         if self.manages_own_context {
             return Ok(Vec::new());
         }
+        let permitted = crate::capabilities::SessionPermissions::read(&session.extension_data)
+            .is_granted(crate::capabilities::SESSION_MODIFICATION);
         Ok(compaction_part(
             Some(self.context_tokens(session, conversation).await?),
             self.context_limit,
             self.threshold,
+            permitted,
         )
         .into_iter()
         .collect())
@@ -383,5 +393,25 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
                 yielded()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_compaction_part_names_the_permission_when_it_is_denied() {
+        let denied = compaction_part(Some(70_000), 100_000, 0.8, false).unwrap();
+        assert!(denied.contains("~10k tokens remaining"));
+        assert!(denied.contains("/permit session-modification"));
+
+        let permitted = compaction_part(Some(70_000), 100_000, 0.8, true).unwrap();
+        assert_eq!(permitted, "<compaction>~10k tokens remaining</compaction>");
+    }
+
+    #[test]
+    fn the_compaction_part_stays_quiet_well_below_the_threshold() {
+        assert!(compaction_part(Some(10_000), 100_000, 0.8, false).is_none());
     }
 }

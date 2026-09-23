@@ -3,6 +3,9 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
+use crate::capabilities::{
+    capability_names, find_capability, list_capabilities, SessionPermissions,
+};
 use crate::context_mgmt::compact_messages;
 use crate::conversation::message::Message;
 use crate::recipe::Recipe;
@@ -69,6 +72,16 @@ static COMMANDS: &[CommandDef] = &[
         name: "archive",
         description:
             "List the history that compaction or /clear took away, or show one event's messages",
+    },
+    CommandDef {
+        name: "permit",
+        description:
+            "Allow the model to use a capability in this session, e.g. /permit session-modification",
+    },
+    CommandDef {
+        name: "deny",
+        description:
+            "Take a capability away from the model in this session, e.g. /deny session-modification",
     },
 ];
 
@@ -172,6 +185,14 @@ impl Agent {
             }
             "status" => self.handle_status_command(session_id).await,
             "archive" => self.handle_archive_command(session_id, params_str).await,
+            "permit" => {
+                self.handle_capability_command(session_id, params_str, true)
+                    .await
+            }
+            "deny" => {
+                self.handle_capability_command(session_id, params_str, false)
+                    .await
+            }
             "goal" => self.handle_goal_command(params_str, session_id).await,
             "grind" => self.handle_grind_command(params_str, session_id).await,
             _ => {
@@ -383,6 +404,84 @@ impl Agent {
         )
         .await?;
         Ok(Some(user_only_assistant_text(report)))
+    }
+
+    /// `/permit <capability>` and `/deny <capability>`: the only way a
+    /// capability can be turned on or off, so the model can never do it for
+    /// itself.
+    async fn handle_capability_command(
+        &self,
+        session_id: &str,
+        params_str: &str,
+        grant: bool,
+    ) -> Result<Option<Message>> {
+        let name = params_str.trim();
+        let verb = if grant { "permit" } else { "deny" };
+
+        if name.is_empty() {
+            let session = self
+                .config
+                .session_manager
+                .get_session(session_id, false)
+                .await?;
+            let permissions = SessionPermissions::read(&session.extension_data);
+            let mut lines = vec![format!("**Capabilities** (use `/{verb} <name>`)")];
+            for def in list_capabilities() {
+                lines.push(format!(
+                    "- `{}` — {} [{}]",
+                    def.name,
+                    def.description,
+                    if permissions.is_granted(def.name) {
+                        "permitted"
+                    } else {
+                        "denied"
+                    }
+                ));
+            }
+            return Ok(Some(user_only_assistant_text(lines.join("\n"))));
+        }
+
+        if find_capability(name).is_none() {
+            return Ok(Some(user_only_assistant_text(format!(
+                "`{name}` is not a capability. Available: {}.",
+                capability_names()
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))));
+        }
+
+        let mut session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        let mut permissions = SessionPermissions::read(&session.extension_data);
+        let changed = if grant {
+            permissions.grant(name)
+        } else {
+            permissions.revoke(name)
+        };
+        if changed {
+            permissions.write_into(&mut session.extension_data)?;
+            self.config
+                .session_manager
+                .update(session_id)
+                .extension_data(session.extension_data)
+                .apply()
+                .await?;
+        }
+
+        let outcome = if grant { "permitted" } else { "denied" };
+        let note = if changed {
+            String::new()
+        } else {
+            " (already in effect)".to_string()
+        };
+        Ok(Some(user_only_assistant_text(format!(
+            "`{name}` is {outcome} for this session{note}."
+        ))))
     }
 
     async fn handle_prompts_command(

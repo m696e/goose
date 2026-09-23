@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::tool_execution::ToolCallContext;
+use crate::capabilities::SessionPermissions;
 use crate::config::Config;
 use crate::context_mgmt::DEFAULT_COMPACTION_THRESHOLD;
 use crate::session::session_manager::archive_summary;
@@ -160,6 +161,15 @@ impl SessionManagerClient {
         lines.push(match archive_summary(&events) {
             Some(detail) => format!("archived: {detail}"),
             None => "archived: nothing yet".to_string(),
+        });
+
+        let permitted = SessionPermissions::read(&session.extension_data)
+            .is_granted(crate::capabilities::SESSION_MODIFICATION);
+        lines.push(if permitted {
+            "session-modification: permitted".to_string()
+        } else {
+            "session-modification: denied (the user can run /permit session-modification)"
+                .to_string()
         });
 
         Ok(lines.join("\n"))
@@ -310,6 +320,7 @@ mod tests {
         assert!(status.contains("context: 500 tokens as of the last request"));
         assert!(status.contains("messages: 1 visible to you, 1 on record"));
         assert!(status.contains("archived: nothing yet"));
+        assert!(status.contains("session-modification: denied"));
     }
 
     #[tokio::test]

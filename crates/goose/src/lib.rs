@@ -8,6 +8,7 @@ pub use goose_sdk_types::{custom_notifications, custom_requests};
 pub mod action_required_manager;
 pub mod agents;
 pub mod builtin_extension;
+pub mod capabilities;
 pub mod checks;
 pub mod config;
 pub mod context_limit;
