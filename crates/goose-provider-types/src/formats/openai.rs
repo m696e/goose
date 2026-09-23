@@ -575,6 +575,7 @@ pub fn format_messages_with_options(
     }
 
     merge_split_tool_call_messages(&mut messages_spec);
+    keep_tool_results_contiguous(&mut messages_spec);
 
     if let Some(format) = options.thinking_preservation_format {
         inline_reasoning_content(&mut messages_spec, format);
@@ -702,6 +703,56 @@ fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
         }
 
         i = insert_at + num_collected;
+    }
+}
+
+/// An assistant message's `tool_calls` must all be answered before any other kind
+/// of message. When a tool result carries an image, `format_messages_with_options`
+/// puts the image in its own user message right after that tool result, so with
+/// several tool calls in one turn the tool results end up interleaved with images.
+/// Providers reject that shape with "400 Bad Request"; keep the tool results
+/// contiguous and let the images trail them.
+///
+/// Must run after `merge_split_tool_call_messages`, which is what gives a single
+/// assistant message several `tool_calls`.
+fn keep_tool_results_contiguous(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let has_tool_calls = messages[i].get("role") == Some(&json!("assistant"))
+            && messages[i]
+                .get("tool_calls")
+                .and_then(|calls| calls.as_array())
+                .is_some_and(|calls| !calls.is_empty());
+        if !has_tool_calls {
+            i += 1;
+            continue;
+        }
+
+        // Collect the block answering this assistant message: tool results, each
+        // optionally followed by the image-only user message carrying its images.
+        let start = i + 1;
+        let mut end = start;
+        let mut has_image = false;
+        while end < messages.len() {
+            if messages[end].get("role") == Some(&json!("tool")) {
+                end += 1;
+            } else if is_image_only_user_message(&messages[end]) {
+                has_image = true;
+                end += 1;
+            } else {
+                break;
+            }
+        }
+
+        if has_image {
+            let (tool_results, images): (Vec<Value>, Vec<Value>) = messages[start..end]
+                .iter()
+                .cloned()
+                .partition(|message| message.get("role") == Some(&json!("tool")));
+            messages.splice(start..end, tool_results.into_iter().chain(images));
+        }
+
+        i = end;
     }
 }
 
@@ -5060,6 +5111,55 @@ data: [DONE]"#;
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "tc2");
+    }
+
+    #[test]
+    fn test_split_tool_calls_with_images_keep_tool_results_contiguous() {
+        // A turn with two tool calls whose results each carry an image must come out
+        // as one assistant message followed by both tool results before the images.
+        // Providers reject the interleaved order with "400 Bad Request".
+        let screenshot = |call: &str, image: &str| {
+            (
+                Message::assistant()
+                    .with_thinking("reasoning", "")
+                    .with_tool_request(
+                        call,
+                        Ok(CallToolRequestParams::new("screenshot").with_arguments(object!({}))),
+                    ),
+                Message::user().with_tool_response(
+                    call,
+                    Ok(rmcp::model::CallToolResult::success(vec![
+                        ContentBlock::text("screenshot taken"),
+                        ContentBlock::Image(rmcp::model::ImageContent::new(image, "image/png")),
+                    ])),
+                ),
+            )
+        };
+
+        let (assistant_one, result_one) = screenshot("tc1", "image-one");
+        let (assistant_two, result_two) = screenshot("tc2", "image-two");
+        let messages = vec![assistant_one, result_one, assistant_two, result_two];
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                thinking_preservation_format: Some(ThinkingPreservationFormat::ReasoningContent),
+            },
+        );
+
+        let roles: Vec<&str> = spec
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "tool", "user", "user"]);
+        assert_eq!(spec[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(spec[1]["tool_call_id"], "tc1");
+        assert_eq!(spec[2]["tool_call_id"], "tc2");
+        assert_eq!(spec[3]["content"][0]["type"], "image_url");
+        assert_eq!(spec[4]["content"][0]["type"], "image_url");
     }
 
     #[test]
