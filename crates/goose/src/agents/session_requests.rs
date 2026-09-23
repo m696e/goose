@@ -20,9 +20,17 @@ use crate::session::Session;
 /// continuation would replace fewer messages than they are worth.
 pub const MIN_AGENT_VISIBLE_MESSAGES_TO_COMPACT: usize = 4;
 
+/// A note the model carries across a compaction adds to the context it just
+/// paid to shrink, so it is bounded rather than silently truncated.
+pub const MAX_CARRY_CHARS: usize = 4_096;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionRequest {
     pub reason: String,
+    /// Text to keep verbatim in the context after the compaction. Absent means
+    /// nothing but the summary survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<String>,
     pub requested_at: i64,
 }
 
@@ -122,6 +130,55 @@ pub fn decide(session: &Session, conversation: &Conversation) -> CompactionDecis
     CompactionDecision::Apply
 }
 
+/// The note the model asked to keep, as a message in the compacted
+/// conversation. Assistant-role on purpose: a user-role message would qualify
+/// as the next compaction's preserved user prompt and be re-preserved forever.
+pub fn carry_message(carry: &str) -> Message {
+    Message::assistant()
+        .with_text(format!(
+            "Note kept verbatim across the compaction:\n\n{}",
+            carry.trim()
+        ))
+        .with_visibility(true, true)
+        .with_generated_id_if_missing()
+}
+
+/// Append the note a request carried to the conversation that replaces its
+/// history. The note is the point of the request, so it is added after the
+/// summary, verbatim, rather than handed to the summarizer.
+pub fn with_carry(conversation: Conversation, carry: Option<&str>) -> Conversation {
+    let Some(carry) = carry.map(str::trim).filter(|carry| !carry.is_empty()) else {
+        return conversation;
+    };
+    let mut conversation = conversation;
+    conversation.push(carry_message(carry));
+    conversation
+}
+
+/// A request that is not applied cannot keep its note; say so, so a model that
+/// still needs the information writes it somewhere durable instead.
+pub fn carry_not_kept(request: &CompactionRequest) -> &'static str {
+    match request.carry {
+        Some(_) => " The note you attached was not kept.",
+        None => "",
+    }
+}
+
+/// Trim a note and reject one too long to be worth keeping: a carry that
+/// re-creates the context you just paid to compact defeats the point.
+pub fn validate_carry(carry: Option<&str>) -> Result<Option<String>, String> {
+    let Some(carry) = carry.map(str::trim).filter(|carry| !carry.is_empty()) else {
+        return Ok(None);
+    };
+    let length = carry.chars().count();
+    if length > MAX_CARRY_CHARS {
+        return Err(format!(
+            "The note is {length} characters; the limit is {MAX_CARRY_CHARS}. Keep only what you cannot re-derive, and write the rest somewhere durable."
+        ));
+    }
+    Ok(Some(carry.to_string()))
+}
+
 /// The user-facing notice for a request that was refused because the capability
 /// is denied.
 pub fn denied_notice(request: &CompactionRequest) -> Message {
@@ -165,6 +222,7 @@ mod tests {
     use super::*;
     use crate::config::GooseMode;
     use crate::session::session_manager::SessionType;
+    use rmcp::model::Role;
 
     fn message(id: &str) -> Message {
         Message::user().with_id(id).with_text(id)
@@ -236,6 +294,7 @@ mod tests {
         let state = SessionRequestState {
             pending_compaction: Some(CompactionRequest {
                 reason: "the tool output is no longer needed".to_string(),
+                carry: Some("step 3 of 7: inputs are in /tmp/step3.json".to_string()),
                 requested_at: 42,
             }),
             denied_compaction: None,
@@ -270,6 +329,7 @@ mod tests {
 
         let request = CompactionRequest {
             reason: "finished reading the logs".to_string(),
+            carry: None,
             requested_at: 0,
         };
 
@@ -286,5 +346,60 @@ mod tests {
         assert!(refusal_message("only 2 message(s) are in your context")
             .as_concat_text()
             .contains("No compaction this time"));
+    }
+
+    #[test]
+    fn a_carry_is_added_after_the_compacted_history_and_visible_to_both() {
+        let conversation = with_carry(conversation_of(2), Some("step 3 of 7"));
+
+        let carried = conversation.messages().last().unwrap();
+        assert!(carried.as_concat_text().contains("step 3 of 7"));
+        assert!(carried.is_agent_visible());
+        assert!(carried.is_user_visible());
+        assert!(carried.id.is_some());
+        assert!(conversation
+            .messages()
+            .iter()
+            .filter(|message| message.as_concat_text().contains("step 3 of 7"))
+            .all(|message| message.role == Role::Assistant));
+    }
+
+    #[test]
+    fn no_carry_leaves_the_conversation_alone() {
+        let before = conversation_of(2);
+
+        assert_eq!(with_carry(before.clone(), None).messages().len(), 2);
+        assert_eq!(
+            with_carry(before.clone(), Some("  \n ")).messages().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_carry_is_trimmed_and_bounded() {
+        assert_eq!(
+            validate_carry(Some("  keep this  ")).unwrap(),
+            Some("keep this".to_string())
+        );
+        assert_eq!(validate_carry(Some("   ")).unwrap(), None);
+        assert_eq!(validate_carry(None).unwrap(), None);
+
+        let long = "x".repeat(MAX_CARRY_CHARS + 1);
+        let error = validate_carry(Some(&long)).unwrap_err();
+        assert!(error.contains(&MAX_CARRY_CHARS.to_string()));
+        assert!(validate_carry(Some(&"x".repeat(MAX_CARRY_CHARS))).is_ok());
+    }
+
+    #[test]
+    fn a_request_that_is_not_applied_says_its_note_was_not_kept() {
+        let mut request = CompactionRequest {
+            reason: "done with the logs".to_string(),
+            carry: None,
+            requested_at: 0,
+        };
+        assert!(carry_not_kept(&request).is_empty());
+
+        request.carry = Some("step 3 of 7".to_string());
+        assert!(carry_not_kept(&request).contains("was not kept"));
     }
 }

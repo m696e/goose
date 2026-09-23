@@ -33,6 +33,27 @@ impl StatusOperation {
     }
 }
 
+/// A queued compaction request, if there is one, so a user reading /status knows
+/// history is about to change.
+fn pending_request(session: &Session) -> String {
+    let state = crate::agents::session_requests::SessionRequestState::read(session);
+    if let Some(pending) = state.pending_compaction.as_ref() {
+        let carried = pending
+            .carry
+            .as_deref()
+            .map(|carry| format!(", carrying {} character(s) of note", carry.chars().count()))
+            .unwrap_or_default();
+        return format!(
+            "\n- Compaction: requested ({}){carried}; applied at the next turn boundary",
+            pending.reason
+        );
+    }
+    if state.denied_compaction.is_some() {
+        return "\n- Compaction: requested while not permitted; nothing was applied".to_string();
+    }
+    String::new()
+}
+
 #[async_trait]
 impl Operation<Session, GooseEffect> for StatusOperation {
     fn name(&self) -> &'static str {
@@ -76,7 +97,7 @@ impl Operation<Session, GooseEffect> for StatusOperation {
         } else {
             "N/A".to_string()
         };
-        let response = Message::assistant().with_text(format!("**Session status**\n\n- Model: {}\n- Provider: {}\n- Mode: {}\n- Tokens (lifetime): {}\n- Context: {} / {} tokens ({}){}", self.model_config.model_name, self.provider.get_name(), session.goose_mode, lifetime_tokens, context_tokens, context_limit, context_pct, archive)).with_visibility(true, false);
+        let response = Message::assistant().with_text(format!("**Session status**\n\n- Model: {}\n- Provider: {}\n- Mode: {}\n- Tokens (lifetime): {}\n- Context: {} / {} tokens ({}){}{}", self.model_config.model_name, self.provider.get_name(), session.goose_mode, lifetime_tokens, context_tokens, context_limit, context_pct, archive, pending_request(session))).with_visibility(true, false);
         let command_message = messages_since_kickoff(conversation)?
             .first()
             .cloned()

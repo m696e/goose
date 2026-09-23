@@ -57,6 +57,9 @@ impl CompactionTrigger {
 pub struct CompactionEvent {
     pub trigger: CompactionTrigger,
     pub reason: Option<String>,
+    /// Text the model asked to keep verbatim across a compaction it requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<String>,
     pub before_tokens: Option<i32>,
     pub after_tokens: Option<i32>,
     pub archived_message_ids: Vec<String>,
@@ -74,10 +77,18 @@ impl CompactionEvent {
         Self {
             trigger,
             reason,
+            carry: None,
             before_tokens,
             after_tokens,
             archived_message_ids: newly_archived_ids(before, after),
         }
+    }
+
+    /// Note the text this compaction carried over, so the record says what was
+    /// deliberately kept as well as what was hidden.
+    pub fn with_carry(mut self, carry: Option<String>) -> Self {
+        self.carry = carry.filter(|carry| !carry.trim().is_empty());
+        self
     }
 
     pub fn archived_message_count(&self) -> usize {
@@ -165,6 +176,34 @@ mod tests {
 
         assert_eq!(event.archived_message_ids, vec!["a"]);
         assert_eq!(event.archived_message_count(), 1);
+    }
+
+    #[test]
+    fn an_event_records_the_text_a_compaction_carried_over() {
+        let before = Conversation::new_unvalidated(vec![message("a", true)]);
+        let after = Conversation::empty();
+
+        let event =
+            CompactionEvent::new(CompactionTrigger::Model, None, &before, &after, None, None)
+                .with_carry(Some("step 3 of 7".to_string()));
+
+        assert_eq!(event.carry.as_deref(), Some("step 3 of 7"));
+        assert_eq!(event.archived_message_count(), 1);
+    }
+
+    #[test]
+    fn a_blank_carry_is_no_carry() {
+        let event = CompactionEvent::new(
+            CompactionTrigger::Model,
+            None,
+            &Conversation::empty(),
+            &Conversation::empty(),
+            None,
+            None,
+        )
+        .with_carry(Some("   \n ".to_string()));
+
+        assert_eq!(event.carry, None);
     }
 
     #[test]

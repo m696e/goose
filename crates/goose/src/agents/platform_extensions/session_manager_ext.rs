@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::session_requests::{CompactionRequest, SessionRequestState};
+use crate::agents::session_requests::{validate_carry, CompactionRequest, SessionRequestState};
 use crate::agents::tool_execution::ToolCallContext;
 use crate::capabilities::SessionPermissions;
 use crate::config::Config;
@@ -36,6 +36,11 @@ struct RequestCompactionParams {
     /// Why this is the right moment to compact, in one sentence. This is what
     /// the user reads, and it is kept as the record of the request.
     reason: String,
+    /// State to keep verbatim after the compaction: what you cannot re-derive
+    /// and would otherwise only survive inside a summary. Text only, and keep
+    /// it short — anything longer belongs in a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    carry: Option<String>,
 }
 
 pub struct SessionManagerClient {
@@ -56,6 +61,8 @@ impl SessionManagerClient {
 
                 Use session_status to see how full your context is before you commit to a long
                 stretch of work, and when you are deciding whether history still has to be kept.
+                When you ask for a compaction, attach anything that must survive it exactly as
+                written to the request's carry field.
             "#}
                 .to_string(),
             );
@@ -185,14 +192,38 @@ impl SessionManagerClient {
                 .to_string()
         });
 
+        let request_state = SessionRequestState::read(&session);
+        if let Some(pending) = request_state.pending_compaction.as_ref() {
+            let carried = pending
+                .carry
+                .as_deref()
+                .map(|carry| format!(", carrying {} character(s) of note", carry.chars().count()))
+                .unwrap_or_default();
+            lines.push(format!(
+                "compaction: requested ({}){carried}; applied at the next turn boundary",
+                pending.reason
+            ));
+        } else if request_state.denied_compaction.is_some() {
+            lines.push(
+                "compaction: requested while not permitted; nothing was applied, and the user has been told"
+                    .to_string(),
+            );
+        }
+
         Ok(lines.join("\n"))
     }
 
-    async fn request_compaction(&self, session_id: &str, reason: &str) -> Result<String, String> {
+    async fn request_compaction(
+        &self,
+        session_id: &str,
+        reason: &str,
+        carry: Option<&str>,
+    ) -> Result<String, String> {
         let reason = reason.trim();
         if reason.is_empty() {
             return Err("A reason is required: it is the record of the request.".to_string());
         }
+        let carry = validate_carry(carry)?;
 
         let manager = &self.context.session_manager;
         let mut session = manager
@@ -202,6 +233,7 @@ impl SessionManagerClient {
 
         let request = CompactionRequest {
             reason: reason.to_string(),
+            carry: carry.clone(),
             requested_at: chrono::Utc::now().timestamp(),
         };
         let mut state = SessionRequestState::read(&session);
@@ -218,10 +250,19 @@ impl SessionManagerClient {
                 );
             }
             state.pending_compaction = Some(request);
-            "Compaction requested. It will be applied at the next turn boundary, before your next request.".to_string()
+            match carry {
+                Some(_) => "Compaction requested, with your note. It will be applied at the next turn boundary, before your next request.".to_string(),
+                None => "Compaction requested. It will be applied at the next turn boundary, before your next request.".to_string(),
+            }
         } else {
             state.denied_compaction = Some(request);
-            "Compaction is not permitted in this session, so nothing was done. The user has been shown your request and can run /permit session-modification to allow it; ask them if you need it now.".to_string()
+            let note = match carry {
+                Some(_) => " Your note was not kept.",
+                None => "",
+            };
+            format!(
+                "Compaction is not permitted in this session, so nothing was done.{note} The user has been shown your request and can run /permit session-modification to allow it; ask them if you need it now."
+            )
         };
 
         state
@@ -278,6 +319,11 @@ impl SessionManagerClient {
                 is no longer worth its space — a long tool output you have finished with, a
                 sub-task you have closed out — rather than waiting for the automatic threshold.
 
+                Use carry for state that must survive exactly as written — a step number, a path,
+                parameters you cannot re-derive. It is kept verbatim after the summary, so keep it
+                short and put anything longer in a file. The request is not applied if it is
+                refused, and then neither is the note.
+
                 It only happens if the user has permitted session modification in this session, and
                 it is applied at the next turn boundary, before your next request.
             "#}
@@ -326,7 +372,12 @@ impl McpClientTrait for SessionManagerClient {
                     .and_then(|arguments| arguments.get("reason"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                self.request_compaction(&ctx.session_id, reason).await
+                let carry = arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("carry"))
+                    .and_then(|value| value.as_str());
+                self.request_compaction(&ctx.session_id, reason, carry)
+                    .await
             }
             _ => Err(format!("Unknown tool: {name}")),
         };
@@ -490,7 +541,10 @@ mod tests {
         let (session, manager, _tmp) = session_with_history().await;
         let client = client(&manager, &session);
 
-        assert!(client.request_compaction(&session.id, "  ").await.is_err());
+        assert!(client
+            .request_compaction(&session.id, "  ", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -502,7 +556,7 @@ mod tests {
         let client = client(&manager, &session);
 
         let text = client
-            .request_compaction(&session.id, "the logs are done with")
+            .request_compaction(&session.id, "the logs are done with", None)
             .await
             .unwrap();
 
@@ -545,7 +599,7 @@ mod tests {
         let client = client(&manager, &session);
 
         let text = client
-            .request_compaction(&session.id, "the logs are done with")
+            .request_compaction(&session.id, "the logs are done with", None)
             .await
             .unwrap();
         assert!(text.contains("Compaction requested"));
@@ -561,10 +615,59 @@ mod tests {
         );
 
         let again = client
-            .request_compaction(&session.id, "again")
+            .request_compaction(&session.id, "again", None)
             .await
             .unwrap();
         assert!(again.contains("already pending"));
+    }
+
+    #[tokio::test]
+    async fn a_note_is_bounded_and_shown_while_the_request_waits() {
+        use crate::agents::session_requests::{SessionRequestState, MAX_CARRY_CHARS};
+        use crate::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+
+        let (session, manager, _tmp) = session_with_history().await;
+        let mut session_data = manager.get_session(&session.id, false).await.unwrap();
+        let mut permissions = SessionPermissions::default();
+        permissions.grant(SESSION_MODIFICATION);
+        permissions
+            .write_into(&mut session_data.extension_data)
+            .unwrap();
+        manager
+            .update(&session.id)
+            .extension_data(session_data.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        let client = client(&manager, &session);
+
+        let too_long = "x".repeat(MAX_CARRY_CHARS + 1);
+        let error = client
+            .request_compaction(&session.id, "why not", Some(&too_long))
+            .await
+            .unwrap_err();
+        assert!(error.contains("limit"));
+        assert!(
+            SessionRequestState::read(&manager.get_session(&session.id, false).await.unwrap())
+                .pending_compaction
+                .is_none()
+        );
+
+        let text = client
+            .request_compaction(&session.id, "why not", Some("  step 3 of 7  "))
+            .await
+            .unwrap();
+        assert!(text.contains("with your note"));
+
+        let status = client.session_status(&session.id).await.unwrap();
+        assert!(status.contains("compaction: requested (why not)"));
+        assert!(status.contains("carrying 11 character(s) of note"));
+        assert_eq!(
+            SessionRequestState::read(&manager.get_session(&session.id, false).await.unwrap())
+                .pending_compaction
+                .and_then(|request| request.carry),
+            Some("step 3 of 7".to_string())
+        );
     }
 
     #[tokio::test]

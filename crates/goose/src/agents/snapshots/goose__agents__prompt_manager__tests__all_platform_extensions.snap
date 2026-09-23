@@ -125,6 +125,8 @@ Session management tools report on the session you are working in.
 
 Use session_status to see how full your context is before you commit to a long
 stretch of work, and when you are deciding whether history still has to be kept.
+When you ask for a compaction, attach anything that must survive it exactly as
+written to the request's carry field.
 
 ## skills
 

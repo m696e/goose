@@ -817,8 +817,8 @@ impl Agent {
         conversation: &mut Conversation,
     ) -> Result<Option<Message>> {
         use crate::agents::session_requests::{
-            applied_notice, decide, denied_notice, refusal_message, CompactionDecision,
-            SessionRequestState,
+            applied_notice, carry_not_kept, decide, denied_notice, refusal_message, with_carry,
+            CompactionDecision, SessionRequestState,
         };
 
         let session = session_manager.get_session(session_id, false).await?;
@@ -848,8 +848,12 @@ impl Agent {
             CompactionDecision::Refused(detail) => {
                 state.persist(session_manager, session_id).await?;
                 Ok(Some(
-                    self.persist_notice(session_manager, session_id, refusal_message(&detail))
-                        .await?,
+                    self.persist_notice(
+                        session_manager,
+                        session_id,
+                        refusal_message(&format!("{detail}{}", carry_not_kept(&request))),
+                    )
+                    .await?,
                 ))
             }
             CompactionDecision::Apply => {
@@ -867,7 +871,7 @@ impl Agent {
                 {
                     Ok(result) => {
                         let compacted = crate::session::compaction_event::ensure_message_ids(
-                            result.conversation,
+                            with_carry(result.conversation, request.carry.as_deref()),
                         );
                         let event = CompactionEvent::new(
                             CompactionTrigger::Model,
@@ -876,7 +880,8 @@ impl Agent {
                             &compacted,
                             before_tokens,
                             Some(result.retained_context_tokens),
-                        );
+                        )
+                        .with_carry(request.carry.clone());
                         session_manager
                             .save_compacted_conversation(session_id, &compacted, &event)
                             .await?;

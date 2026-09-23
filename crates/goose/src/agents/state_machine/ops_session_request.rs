@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use tracing_futures::Instrument;
 
 use crate::agents::session_requests::{
-    applied_notice, decide, denied_notice, refusal_message, CompactionDecision, SessionRequestState,
+    applied_notice, carry_not_kept, decide, denied_notice, refusal_message, with_carry,
+    CompactionDecision, SessionRequestState,
 };
 use crate::agents::state_machine::ops_llm::{chat_span, record_chat_usage};
 use crate::agents::state_machine::{
@@ -72,6 +73,7 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                 Self::persist(session, state, notice).await
             }
             CompactionDecision::Refused(detail) => {
+                let detail = format!("{detail}{}", carry_not_kept(&request));
                 let notice = emit.message(refusal_message(&detail)).await;
                 Self::persist(session, state, notice).await
             }
@@ -96,7 +98,7 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                 .await
                 {
                     Ok(result) => {
-                        let compacted = result.conversation;
+                        let compacted = with_carry(result.conversation, request.carry.as_deref());
                         let usage = result.usage;
                         record_chat_usage(&span, &usage);
                         let event = CompactionEvent::new(
@@ -106,7 +108,8 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                             &compacted,
                             before_tokens,
                             Some(result.retained_context_tokens),
-                        );
+                        )
+                        .with_carry(request.carry.clone());
                         let notice = emit
                             .message(applied_notice(
                                 &request,

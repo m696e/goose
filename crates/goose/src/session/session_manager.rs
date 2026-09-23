@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -261,14 +261,29 @@ pub async fn archive_report(
                 (Some(before), Some(after)) => format!(" — {before} → {after} tokens"),
                 _ => String::new(),
             };
+            let carried = stored
+                .event
+                .carry
+                .as_deref()
+                .map(|carry| {
+                    let snippet: String = carry.trim().chars().take(80).collect();
+                    let ellipsis = if carry.trim().chars().count() > 80 {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    format!(" — kept a note: {}{}", snippet.replace('\n', " "), ellipsis)
+                })
+                .unwrap_or_default();
             lines.push(format!(
-                "- `{}` {} · {} · {} message(s){}{}",
+                "- `{}` {} · {} · {} message(s){}{}{}",
                 stored.id,
                 stored.created_at,
                 stored.event.trigger.as_str(),
                 stored.event.archived_message_count(),
                 context,
                 reason,
+                carried,
             ));
         }
         lines.push(String::new());
@@ -348,7 +363,25 @@ pub async fn archive_report(
         selected.event.archived_message_count()
     );
 
-    Ok(format!("{header}{}{footer}", body.join("\n\n---\n\n")))
+    let carried = selected
+        .event
+        .carry
+        .as_deref()
+        .map(|carry| {
+            let truncated = carry.chars().count() > MAX_MESSAGE_CHARS;
+            let text: String = carry.chars().take(MAX_MESSAGE_CHARS).collect();
+            format!(
+                "\n\n**Kept across this compaction**{}\n\n{}",
+                if truncated { " (truncated)" } else { "" },
+                text
+            )
+        })
+        .unwrap_or_default();
+
+    Ok(format!(
+        "{header}{}{carried}{footer}",
+        body.join("\n\n---\n\n")
+    ))
 }
 
 impl<'a> SessionUpdateBuilder<'a> {
@@ -1914,6 +1947,9 @@ impl SessionStorage {
             18 => {
                 Self::create_compaction_events_table(tx).await?;
             }
+            19 => {
+                Self::add_compaction_event_carry_column(tx).await?;
+            }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
             }
@@ -2321,6 +2357,7 @@ impl SessionStorage {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 trigger TEXT NOT NULL,
                 reason TEXT,
+                carry TEXT,
                 before_tokens INTEGER,
                 after_tokens INTEGER,
                 archived_message_ids TEXT NOT NULL DEFAULT '[]'
@@ -2336,17 +2373,36 @@ impl SessionStorage {
         Ok(())
     }
 
+    /// The create statement already includes `carry`, so a database that gets
+    /// the table from a later-versioned migration must not add it again.
+    async fn add_compaction_event_carry_column(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+    ) -> Result<()> {
+        let has_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('compaction_events') WHERE name = 'carry'",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if has_column == 0 {
+            sqlx::query("ALTER TABLE compaction_events ADD COLUMN carry TEXT")
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn insert_compaction_event(
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         session_id: &str,
         event: &CompactionEvent,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO compaction_events (session_id, trigger, reason, before_tokens, after_tokens, archived_message_ids) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO compaction_events (session_id, trigger, reason, carry, before_tokens, after_tokens, archived_message_ids) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(event.trigger.as_str())
         .bind(event.reason.as_deref())
+        .bind(event.carry.as_deref())
         .bind(event.before_tokens)
         .bind(event.after_tokens)
         .bind(serde_json::to_string(&event.archived_message_ids)?)
@@ -2520,12 +2576,13 @@ impl SessionStorage {
                 String,
                 String,
                 Option<String>,
+                Option<String>,
                 Option<i32>,
                 Option<i32>,
                 String,
             ),
         >(
-            "SELECT id, strftime('%Y-%m-%d %H:%M:%S', created_at), trigger, reason, before_tokens, after_tokens, archived_message_ids \
+            "SELECT id, strftime('%Y-%m-%d %H:%M:%S', created_at), trigger, reason, carry, before_tokens, after_tokens, archived_message_ids \
              FROM compaction_events WHERE session_id = ? ORDER BY id",
         )
         .bind(session_id)
@@ -2540,6 +2597,7 @@ impl SessionStorage {
                     created_at,
                     trigger,
                     reason,
+                    carry,
                     before_tokens,
                     after_tokens,
                     archived_message_ids,
@@ -2550,6 +2608,7 @@ impl SessionStorage {
                         trigger: CompactionTrigger::parse(&trigger)
                             .unwrap_or(CompactionTrigger::Manual),
                         reason,
+                        carry,
                         before_tokens,
                         after_tokens,
                         archived_message_ids: serde_json::from_str(&archived_message_ids)

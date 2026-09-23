@@ -576,6 +576,16 @@ async fn set_pending_compaction_request(
     reason: &str,
     granted: bool,
 ) {
+    set_pending_compaction_request_carrying(agent, session, reason, granted, None).await;
+}
+
+async fn set_pending_compaction_request_carrying(
+    agent: &Agent,
+    session: &Session,
+    reason: &str,
+    granted: bool,
+    carry: Option<&str>,
+) {
     use goose::agents::session_requests::{CompactionRequest, SessionRequestState};
     use goose::capabilities::{SessionPermissions, SESSION_MODIFICATION};
 
@@ -595,6 +605,7 @@ async fn set_pending_compaction_request(
     let state = SessionRequestState {
         pending_compaction: Some(CompactionRequest {
             reason: reason.to_string(),
+            carry: carry.map(str::to_string),
             requested_at: 0,
         }),
         ..Default::default()
@@ -714,6 +725,104 @@ async fn a_permitted_compaction_request_compacts_at_the_next_boundary() -> Resul
         recorded[0].event.reason.as_deref(),
         Some("the first exchange is done")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_carried_note_survives_the_compaction_verbatim() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session =
+        setup_test_session(&agent, &temp_dir, "carried-note", four_message_history()).await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    let note = "step 3 of 7: resume with /tmp/step3.json, key abc123";
+    set_pending_compaction_request_carrying(&agent, &session, "the step is done", true, Some(note))
+        .await;
+    run_command(&agent, &session, "carry on").await?;
+
+    let stored = agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await?;
+    let in_context = stored
+        .conversation
+        .clone()
+        .unwrap_or_default()
+        .agent_visible_messages()
+        .iter()
+        .map(|message| message.as_concat_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        in_context.contains(note),
+        "the note must survive verbatim, not only inside the summary: {in_context}"
+    );
+
+    let recorded = agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].event.carry.as_deref(), Some(note));
+
+    let listing = text_of(&run_command(&agent, &session, "/archive").await?);
+    assert!(listing.contains("kept a note:"));
+    let dump = text_of(&run_command(&agent, &session, "/archive last").await?);
+    assert!(dump.contains("**Kept across this compaction**"));
+    assert!(dump.contains(note));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_request_drops_its_note() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "refused-note",
+        vec![Message::user().with_id("m1").with_text("only one message")],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    set_pending_compaction_request_carrying(
+        &agent,
+        &session,
+        "too early",
+        true,
+        Some("must not survive"),
+    )
+    .await;
+    let events = run_command(&agent, &session, "carry on").await?;
+
+    let text = text_of(&events);
+    assert!(text.contains("No compaction this time"));
+    assert!(text.contains("was not kept"));
+    assert!(!text.contains("must not survive"));
+    assert!(agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?
+        .is_empty());
 
     Ok(())
 }
