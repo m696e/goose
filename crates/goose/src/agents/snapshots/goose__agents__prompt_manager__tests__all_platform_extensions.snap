@@ -118,6 +118,14 @@ When running Python scripts or commands, always use `python3` instead of `python
 
 ### Instructions
 Create, list, update, pause, resume, and remove scheduled recipe runs, and inspect the sessions they produced.
+## session-manager
+
+### Instructions
+Session management tools report on the session you are working in.
+
+Use session_status to see how full your context is before you commit to a long
+stretch of work, and when you are deciding whether history still has to be kept.
+
 ## skills
 
 ### Instructions

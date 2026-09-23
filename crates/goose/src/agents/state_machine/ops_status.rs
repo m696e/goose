@@ -62,7 +62,7 @@ impl Operation<Session, GooseEffect> for StatusOperation {
             .await
             .map(|events| {
                 crate::session::session_manager::archive_summary(&events)
-                    .map(|line| format!("\n{line}"))
+                    .map(|detail| format!("\n- Archived history: {detail}"))
                     .unwrap_or_default()
             })
             .unwrap_or_default();

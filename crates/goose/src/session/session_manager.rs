@@ -204,7 +204,8 @@ pub struct StoredCompactionEvent {
     pub event: CompactionEvent,
 }
 
-/// A one-line description of what a session has archived, for /status.
+/// What a session has archived: how much, in how many events, and the most
+/// recent one. Callers label it ("Archived history: ...").
 pub fn archive_summary(events: &[StoredCompactionEvent]) -> Option<String> {
     let last = events.last()?;
     let messages: usize = events
@@ -219,7 +220,7 @@ pub fn archive_summary(events: &[StoredCompactionEvent]) -> Option<String> {
         .unwrap_or_default();
 
     Some(format!(
-        "- Archived history: {} message(s) in {} event(s) (last: {} at {}{})",
+        "{} message(s) in {} event(s) (last: {} at {}{})",
         messages,
         events.len(),
         last.event.trigger.as_str(),
