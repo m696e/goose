@@ -526,6 +526,195 @@ fn text_of(events: &[AgentEvent]) -> String {
         .join("\n")
 }
 
+/// The text of every system notification in a turn: notices are what the user
+/// is told, and they carry no text content.
+fn notifications_of(events: &[AgentEvent]) -> String {
+    use goose::conversation::message::MessageContentBlock;
+
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Message(message) => Some(message),
+            _ => None,
+        })
+        .flat_map(|message| message.content.iter())
+        .filter_map(|content| match content {
+            MessageContentBlock::SystemNotification(notification) => Some(notification.msg.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn set_pending_compaction_request(
+    agent: &Agent,
+    session: &Session,
+    reason: &str,
+    granted: bool,
+) {
+    use goose::agents::session_requests::{CompactionRequest, SessionRequestState};
+    use goose::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+
+    let manager = &agent.config.session_manager;
+    let mut session_data = manager.get_session(&session.id, false).await.unwrap();
+
+    let mut permissions = SessionPermissions::read(&session_data.extension_data);
+    if granted {
+        permissions.grant(SESSION_MODIFICATION);
+    } else {
+        permissions.revoke(SESSION_MODIFICATION);
+    }
+    permissions
+        .write_into(&mut session_data.extension_data)
+        .unwrap();
+
+    let state = SessionRequestState {
+        pending_compaction: Some(CompactionRequest {
+            reason: reason.to_string(),
+            requested_at: 0,
+        }),
+        ..Default::default()
+    };
+    state.write_into(&mut session_data.extension_data).unwrap();
+
+    manager
+        .update(&session.id)
+        .extension_data(session_data.extension_data)
+        .apply()
+        .await
+        .unwrap();
+}
+
+fn four_message_history() -> Vec<Message> {
+    vec![
+        Message::user().with_id("m1").with_text("first question"),
+        Message::assistant().with_id("m2").with_text("first answer"),
+        Message::user().with_id("m3").with_text("second question"),
+        Message::assistant()
+            .with_id("m4")
+            .with_text("second answer"),
+    ]
+}
+
+#[tokio::test]
+async fn a_denied_compaction_request_is_reported_and_changes_nothing() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session =
+        setup_test_session(&agent, &temp_dir, "denied-request", four_message_history()).await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    set_pending_compaction_request(&agent, &session, "the logs are no longer needed", false).await;
+    let events = run_command(&agent, &session, "carry on").await?;
+
+    let notices = notifications_of(&events);
+    assert!(notices.contains("goose asked to compact this conversation"));
+    assert!(notices.contains("the logs are no longer needed"));
+    assert!(notices.contains("/permit session-modification"));
+
+    assert!(agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?
+        .is_empty());
+
+    let state = goose::agents::session_requests::SessionRequestState::read(
+        &agent
+            .config
+            .session_manager
+            .get_session(&session.id, false)
+            .await?,
+    );
+    assert!(state.pending_compaction.is_none());
+    assert!(state.denied_compaction.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_permitted_compaction_request_compacts_at_the_next_boundary() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "permitted-request",
+        four_message_history(),
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    set_pending_compaction_request(&agent, &session, "the first exchange is done", true).await;
+    let events = run_command(&agent, &session, "carry on").await?;
+
+    let notices = notifications_of(&events);
+    assert!(notices.contains("Compacted at goose's request"));
+    assert!(notices.contains("the first exchange is done"));
+
+    let recorded = agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].event.trigger,
+        goose::session::CompactionTrigger::Model
+    );
+    assert_eq!(
+        recorded[0].event.reason.as_deref(),
+        Some("the first exchange is done")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_granted_request_on_a_short_conversation_is_refused() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "short-request",
+        vec![Message::user().with_id("m1").with_text("only one message")],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    set_pending_compaction_request(&agent, &session, "too early", true).await;
+    let events = run_command(&agent, &session, "carry on").await?;
+
+    assert!(text_of(&events).contains("No compaction this time"));
+    assert!(agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?
+        .is_empty());
+
+    Ok(())
+}
+
 async fn agent_visible_message_ids(agent: &Agent, session: &Session) -> Vec<String> {
     agent
         .config

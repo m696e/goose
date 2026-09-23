@@ -41,9 +41,9 @@ use crate::agents::state_machine::{
     Emitter, EntryHookOperation, ExitOnErrorOperation, ForegroundSubagentOperation, GooseEffect,
     GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
     Operation, ProjectOperation, RecipeOperation, RequestSizeOperation, RetryOperation,
-    SkillOperation, SlashCommandOperation, StateMachine, StatusOperation, SteerOperation,
-    SteerQueue, Step, StopHookOperation, ToolApprovalOperation, ToolExecutionOperation,
-    ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
+    SessionRequestOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
+    SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::types::{
@@ -1715,6 +1715,10 @@ impl Agent {
             Arc::new(BangShellOperation::new()),
         ];
         if !manages_own_context {
+            operations.push(Arc::new(SessionRequestOperation::new(
+                provider.clone(),
+                model_config.clone(),
+            )));
             operations.push(Arc::new(CompactionOperation::new(
                 provider.clone(),
                 model_config.clone(),
@@ -2831,6 +2835,21 @@ impl Agent {
                     last_assistant_text = MAX_TURNS_MESSAGE.to_string();
                     yield AgentEvent::Message(Message::assistant().with_text(last_assistant_text.clone()));
                     break;
+                }
+
+                // A compaction the model asked for is applied here, between
+                // turns: the tool pair that asked for it is complete, so history
+                // is never rewritten in the middle of one.
+                match self
+                    .apply_requested_compaction(&session_manager, &session_config.id, &model_config, &mut conversation)
+                    .await?
+                {
+                    Some(notice) => {
+                        yield AgentEvent::HistoryReplaced(conversation.clone());
+                        yield AgentEvent::Message(notice);
+                        continue;
+                    }
+                    None => {}
                 }
 
                 yield AgentEvent::Stage(LlmStage::Prefilling);

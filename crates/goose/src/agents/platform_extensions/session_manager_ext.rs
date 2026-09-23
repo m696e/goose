@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
+use crate::agents::session_requests::{CompactionRequest, SessionRequestState};
 use crate::agents::tool_execution::ToolCallContext;
 use crate::capabilities::SessionPermissions;
 use crate::config::Config;
@@ -24,9 +25,18 @@ use crate::session::session_manager::archive_summary;
 pub static EXTENSION_NAME: &str = "session-manager";
 pub const SESSION_STATUS_TOOL_NAME: &str = "session_status";
 pub const SESSION_STATUS_TOOL_NAME_COMPLETE: &str = "session-manager__session_status";
+pub const REQUEST_COMPACTION_TOOL_NAME: &str = "request_compaction";
+pub const REQUEST_COMPACTION_TOOL_NAME_COMPLETE: &str = "session-manager__request_compaction";
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct SessionStatusParams {}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct RequestCompactionParams {
+    /// Why this is the right moment to compact, in one sentence. This is what
+    /// the user reads, and it is kept as the record of the request.
+    reason: String,
+}
 
 pub struct SessionManagerClient {
     info: InitializeResult,
@@ -175,14 +185,67 @@ impl SessionManagerClient {
         Ok(lines.join("\n"))
     }
 
+    async fn request_compaction(&self, session_id: &str, reason: &str) -> Result<String, String> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err("A reason is required: it is the record of the request.".to_string());
+        }
+
+        let manager = &self.context.session_manager;
+        let mut session = manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|error| format!("Failed to read the session: {error}"))?;
+
+        let request = CompactionRequest {
+            reason: reason.to_string(),
+            requested_at: chrono::Utc::now().timestamp(),
+        };
+        let mut state = SessionRequestState::read(&session);
+        state.requested_compaction_count = state.requested_compaction_count.saturating_add(1);
+
+        let permitted = SessionPermissions::read(&session.extension_data)
+            .is_granted(crate::capabilities::SESSION_MODIFICATION);
+
+        let text = if permitted {
+            if state.pending_compaction.is_some() {
+                return Ok(
+                    "A compaction request is already pending; it will be applied before your next turn."
+                        .to_string(),
+                );
+            }
+            state.pending_compaction = Some(request);
+            "Compaction requested. It will be applied at the next turn boundary, before your next request.".to_string()
+        } else {
+            state.denied_compaction = Some(request);
+            "Compaction is not permitted in this session, so nothing was done. The user has been shown your request and can run /permit session-modification to allow it; ask them if you need it now.".to_string()
+        };
+
+        state
+            .write_into(&mut session.extension_data)
+            .map_err(|error| format!("Failed to record the request: {error}"))?;
+        manager
+            .update(session_id)
+            .extension_data(session.extension_data)
+            .apply()
+            .await
+            .map_err(|error| format!("Failed to record the request: {error}"))?;
+
+        Ok(text)
+    }
+
     fn get_tools() -> Vec<Tool> {
         let schema = schema_for!(SessionStatusParams);
         let schema_value =
             serde_json::to_value(schema).expect("Failed to serialize SessionStatusParams schema");
+        let request_schema = schema_for!(RequestCompactionParams);
+        let request_schema_value = serde_json::to_value(request_schema)
+            .expect("Failed to serialize RequestCompactionParams schema");
 
-        vec![Tool::new(
-            SESSION_STATUS_TOOL_NAME.to_string(),
-            indoc! {r#"
+        vec![
+            Tool::new(
+                SESSION_STATUS_TOOL_NAME.to_string(),
+                indoc! {r#"
                 Report how full your context is: tokens used and the model's context limit, the
                 auto-compaction threshold and how much room is left before it triggers, how many
                 messages are visible to you versus kept on record, and what history has been
@@ -191,16 +254,41 @@ impl SessionManagerClient {
                 Read-only. Use it before starting a long run of tool calls, and when you are
                 deciding whether earlier history still needs to be in context.
             "#}
-            .to_string(),
-            schema_value.as_object().unwrap().clone(),
-        )
-        .annotate(ToolAnnotations::from_raw(
-            Some("Session status".to_string()),
-            Some(true),
-            Some(false),
-            Some(true),
-            Some(false),
-        ))]
+                .to_string(),
+                schema_value.as_object().unwrap().clone(),
+            )
+            .annotate(ToolAnnotations::from_raw(
+                Some("Session status".to_string()),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+            )),
+            Tool::new(
+                REQUEST_COMPACTION_TOOL_NAME.to_string(),
+                indoc! {r#"
+                Ask for the session to compact its conversation history now.
+
+                Compaction replaces the conversation so far with a summary, so anything you still
+                need in detail will be gone from your context; the messages stay on record and
+                /archive can show them. Ask for it when the work has moved on and earlier history
+                is no longer worth its space — a long tool output you have finished with, a
+                sub-task you have closed out — rather than waiting for the automatic threshold.
+
+                It only happens if the user has permitted session modification in this session, and
+                it is applied at the next turn boundary, before your next request.
+            "#}
+                .to_string(),
+                request_schema_value.as_object().unwrap().clone(),
+            )
+            .annotate(ToolAnnotations::from_raw(
+                Some("Request compaction".to_string()),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            )),
+        ]
     }
 }
 
@@ -224,11 +312,19 @@ impl McpClientTrait for SessionManagerClient {
         &self,
         ctx: &ToolCallContext,
         name: &str,
-        _arguments: Option<JsonObject>,
+        arguments: Option<JsonObject>,
         _cancellation_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         let result = match name {
             SESSION_STATUS_TOOL_NAME => self.session_status(&ctx.session_id).await,
+            REQUEST_COMPACTION_TOOL_NAME => {
+                let reason = arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("reason"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                self.request_compaction(&ctx.session_id, reason).await
+            }
             _ => Err(format!("Unknown tool: {name}")),
         };
 
@@ -253,11 +349,13 @@ mod tests {
     use crate::session::session_manager::SessionType;
     use std::sync::Arc;
 
-    async fn client_with(session: &crate::session::Session) -> SessionManagerClient {
-        let session_manager = crate::session::SessionManager::instance();
+    fn client(
+        manager: &Arc<crate::session::SessionManager>,
+        session: &crate::session::Session,
+    ) -> SessionManagerClient {
         SessionManagerClient::new(PlatformExtensionContext {
             extension_manager: None,
-            session_manager: Arc::new(session_manager),
+            session_manager: manager.clone(),
             scheduler: None,
             session: Some(Arc::new(session.clone())),
             use_login_shell_path: false,
@@ -306,14 +404,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_usage_and_the_message_counts() {
         let (session, manager, _tmp) = session_with_history().await;
-        let client = SessionManagerClient::new(PlatformExtensionContext {
-            extension_manager: None,
-            session_manager: manager.clone(),
-            scheduler: None,
-            session: Some(Arc::new(session.clone())),
-            use_login_shell_path: false,
-        })
-        .unwrap();
+        let client = client(&manager, &session);
 
         let status = client.session_status(&session.id).await.unwrap();
 
@@ -326,14 +417,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_the_archive_once_history_is_taken_away() {
         let (session, manager, _tmp) = session_with_history().await;
-        let client = SessionManagerClient::new(PlatformExtensionContext {
-            extension_manager: None,
-            session_manager: manager.clone(),
-            scheduler: None,
-            session: Some(Arc::new(session.clone())),
-            use_login_shell_path: false,
-        })
-        .unwrap();
+        let client = client(&manager, &session);
 
         let conversation = manager
             .get_session(&session.id, true)
@@ -367,14 +451,99 @@ mod tests {
         assert!(crate::agents::extension::PLATFORM_EXTENSIONS.contains_key(EXTENSION_NAME));
 
         let tools = SessionManagerClient::get_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name.as_ref(), SESSION_STATUS_TOOL_NAME);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            vec![SESSION_STATUS_TOOL_NAME, REQUEST_COMPACTION_TOOL_NAME]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_needs_a_reason() {
+        let (session, manager, _tmp) = session_with_history().await;
+        let client = client(&manager, &session);
+
+        assert!(client.request_compaction(&session.id, "  ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_denied_request_is_recorded_so_the_user_is_told() {
+        use crate::agents::session_requests::SessionRequestState;
+        use crate::capabilities::SESSION_MODIFICATION;
+
+        let (session, manager, _tmp) = session_with_history().await;
+        let client = client(&manager, &session);
+
+        let text = client
+            .request_compaction(&session.id, "the logs are done with")
+            .await
+            .unwrap();
+
+        assert!(text.contains("/permit session-modification"));
+        let session = manager.get_session(&session.id, false).await.unwrap();
+        let state = SessionRequestState::read(&session);
+        assert!(state.pending_compaction.is_none());
+        assert_eq!(
+            state
+                .denied_compaction
+                .as_ref()
+                .map(|request| request.reason.as_str()),
+            Some("the logs are done with")
+        );
+        assert_eq!(state.requested_compaction_count, 1);
+        assert!(
+            !crate::capabilities::SessionPermissions::read(&session.extension_data)
+                .is_granted(SESSION_MODIFICATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permitted_request_is_queued_and_asks_once() {
+        use crate::agents::session_requests::SessionRequestState;
+        use crate::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+
+        let (session, manager, _tmp) = session_with_history().await;
+        let mut session_data = manager.get_session(&session.id, false).await.unwrap();
+        let mut permissions = SessionPermissions::default();
+        permissions.grant(SESSION_MODIFICATION);
+        permissions
+            .write_into(&mut session_data.extension_data)
+            .unwrap();
+        manager
+            .update(&session.id)
+            .extension_data(session_data.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        let client = client(&manager, &session);
+
+        let text = client
+            .request_compaction(&session.id, "the logs are done with")
+            .await
+            .unwrap();
+        assert!(text.contains("Compaction requested"));
+
+        let session = manager.get_session(&session.id, false).await.unwrap();
+        let state = SessionRequestState::read(&session);
+        assert_eq!(
+            state
+                .pending_compaction
+                .as_ref()
+                .map(|request| request.reason.as_str()),
+            Some("the logs are done with")
+        );
+
+        let again = client
+            .request_compaction(&session.id, "again")
+            .await
+            .unwrap();
+        assert!(again.contains("already pending"));
     }
 
     #[tokio::test]
     async fn unknown_tools_are_rejected() {
-        let (session, _manager, _tmp) = session_with_history().await;
-        let client = client_with(&session).await;
+        let (session, manager, _tmp) = session_with_history().await;
+        let client = client(&manager, &session);
         let ctx = ToolCallContext::new(session.id.clone(), None, None);
 
         let result = client
