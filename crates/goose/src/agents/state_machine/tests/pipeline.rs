@@ -190,6 +190,7 @@ impl TestPipeline {
         let status_operation = Arc::new(StatusOperation::new(
             provider.clone(),
             self.model_config.clone(),
+            self.session_manager.clone(),
         ));
         let inference_provider = Arc::new(GooseInferenceProvider::new(provider));
         let inference = Arc::new(

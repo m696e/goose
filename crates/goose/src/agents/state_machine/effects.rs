@@ -3,6 +3,7 @@ use crate::conversation::Conversation;
 use crate::providers::base::ProviderUsage;
 use crate::recipe::Recipe;
 use crate::session::ExtensionState;
+use crate::session::compaction_event::CompactionEvent;
 use anyhow::Result;
 use goose_agent::operation::{ConversationEffect, MachineEffect};
 
@@ -11,6 +12,12 @@ pub enum GooseEffect {
     CompactConversation {
         conversation: Conversation,
         usage: Option<ProviderUsage>,
+        event: CompactionEvent,
+    },
+    /// Take the whole conversation away from the agent. `destroy` deletes it.
+    ClearConversation {
+        destroy: bool,
+        event: CompactionEvent,
     },
     SetRecipe(Box<Option<Recipe>>),
     SetExtensionState {

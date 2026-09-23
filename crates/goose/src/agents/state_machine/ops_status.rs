@@ -16,13 +16,19 @@ use crate::session::Session;
 pub struct StatusOperation {
     provider: Arc<dyn Provider>,
     model_config: ModelConfig,
+    session_manager: Arc<crate::session::SessionManager>,
 }
 
 impl StatusOperation {
-    pub fn new(provider: Arc<dyn Provider>, model_config: ModelConfig) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model_config: ModelConfig,
+        session_manager: Arc<crate::session::SessionManager>,
+    ) -> Self {
         Self {
             provider,
             model_config,
+            session_manager,
         }
     }
 }
@@ -50,6 +56,16 @@ impl Operation<Session, GooseEffect> for StatusOperation {
         .await?;
         let context_tokens = session.usage.total_tokens.unwrap_or(0);
         let lifetime_tokens = session.accumulated_usage.total_tokens.unwrap_or(0);
+        let archive = self
+            .session_manager
+            .list_compaction_events(&session.id)
+            .await
+            .map(|events| {
+                crate::session::session_manager::archive_summary(&events)
+                    .map(|line| format!("\n{line}"))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let context_pct = if context_limit > 0 {
             format!(
                 "{}%",
@@ -60,7 +76,7 @@ impl Operation<Session, GooseEffect> for StatusOperation {
         } else {
             "N/A".to_string()
         };
-        let response = Message::assistant().with_text(format!("**Session status**\n\n- Model: {}\n- Provider: {}\n- Mode: {}\n- Tokens (lifetime): {}\n- Context: {} / {} tokens ({})", self.model_config.model_name, self.provider.get_name(), session.goose_mode, lifetime_tokens, context_tokens, context_limit, context_pct)).with_visibility(true, false);
+        let response = Message::assistant().with_text(format!("**Session status**\n\n- Model: {}\n- Provider: {}\n- Mode: {}\n- Tokens (lifetime): {}\n- Context: {} / {} tokens ({}){}", self.model_config.model_name, self.provider.get_name(), session.goose_mode, lifetime_tokens, context_tokens, context_limit, context_pct, archive)).with_visibility(true, false);
         let command_message = messages_since_kickoff(conversation)?
             .first()
             .cloned()

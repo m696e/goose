@@ -68,13 +68,22 @@ async fn proactive_and_manual_compaction_continue_with_replaced_usage() -> Resul
     pipeline.set_total_tokens(100).await;
     let cleared = pipeline.run(["/clear"]).await?;
     assert_eq!(cleared.history_replacements(), 1);
-    assert_eq!(cleared.conversation().messages().len(), 2);
     assert!(cleared
         .conversation()
         .messages()
         .iter()
-        .all(|message| message.is_user_visible() && !message.is_agent_visible()));
+        .all(|message| !message.is_agent_visible()));
     assert_eq!(cleared.session.usage.total_tokens, Some(0));
+
+    let destroyed = pipeline.run(["/clear --destroy"]).await?;
+    assert_eq!(destroyed.history_replacements(), 1);
+    assert_eq!(destroyed.conversation().messages().len(), 2);
+    assert!(destroyed
+        .conversation()
+        .messages()
+        .iter()
+        .all(|message| message.is_user_visible() && !message.is_agent_visible()));
+    assert_eq!(destroyed.session.usage.total_tokens, Some(0));
 
     let (pipeline, _api) = test_pipeline().await?;
     pipeline.set_total_tokens(100).await;

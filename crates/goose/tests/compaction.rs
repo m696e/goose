@@ -494,6 +494,199 @@ async fn test_manual_compaction_updates_token_counts_and_conversation() -> Resul
     Ok(())
 }
 
+async fn run_command(agent: &Agent, session: &Session, command: &str) -> Result<Vec<AgentEvent>> {
+    let session_config = SessionConfig {
+        id: session.id.clone(),
+        schedule_id: None,
+        max_turns: None,
+        retry_config: None,
+    };
+    let stream = agent
+        .reply(
+            Message::user().with_text(command),
+            session_config,
+            goose::agents::state_machine::enabled(),
+            None,
+        )
+        .await?;
+    Ok(stream
+        .filter_map(|event| async move { event.ok() })
+        .collect()
+        .await)
+}
+
+fn text_of(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Message(message) => Some(message.as_concat_text()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn agent_visible_message_ids(agent: &Agent, session: &Session) -> Vec<String> {
+    agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await
+        .unwrap()
+        .conversation
+        .unwrap()
+        .messages()
+        .iter()
+        .filter(|message| message.is_agent_visible())
+        .filter_map(|message| message.id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn clear_archives_the_conversation_and_keeps_the_messages() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "clear-archives",
+        vec![
+            Message::user().with_id("m1").with_text("Remember this"),
+            Message::assistant().with_id("m2").with_text("I will"),
+        ],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    let events = run_command(&agent, &session, "/clear").await?;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::HistoryReplaced(_))));
+
+    let stored = agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await?
+        .conversation
+        .unwrap();
+    for id in ["m1", "m2"] {
+        let message = stored
+            .messages()
+            .iter()
+            .find(|message| message.id.as_deref() == Some(id))
+            .expect("cleared messages must stay on record");
+        assert!(!message.is_agent_visible());
+        assert!(message.is_user_visible());
+    }
+    assert!(agent_visible_message_ids(&agent, &session).await.is_empty());
+
+    let events = agent
+        .config
+        .session_manager
+        .list_compaction_events(&session.id)
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].event.trigger,
+        goose::session::CompactionTrigger::Clear
+    );
+    for id in ["m1", "m2"] {
+        assert!(
+            events[0]
+                .event
+                .archived_message_ids
+                .contains(&id.to_string()),
+            "the cleared messages must be recorded as archived"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_destroy_deletes_the_messages() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "clear-destroys",
+        vec![
+            Message::user().with_id("m1").with_text("Remember this"),
+            Message::assistant().with_id("m2").with_text("I will"),
+        ],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    run_command(&agent, &session, "/clear --destroy").await?;
+
+    let stored = agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await?
+        .conversation
+        .unwrap();
+    assert!(stored
+        .messages()
+        .iter()
+        .all(|message| !matches!(message.id.as_deref(), Some("m1") | Some("m2"))));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_and_archive_report_the_archived_history() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "archive-report",
+        vec![
+            Message::user().with_id("m1").with_text("Remember this"),
+            Message::assistant().with_id("m2").with_text("I will"),
+        ],
+    )
+    .await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    run_command(&agent, &session, "/clear").await?;
+
+    let status = text_of(&run_command(&agent, &session, "/status").await?);
+    assert!(status.contains("Archived history:"));
+    assert!(status.contains("in 1 event(s)"));
+
+    let listing = text_of(&run_command(&agent, &session, "/archive").await?);
+    assert!(listing.contains("**Archived history**: 1 event(s)"));
+
+    let dump = text_of(&run_command(&agent, &session, "/archive last").await?);
+    assert!(dump.contains("Remember this"));
+    assert!(dump.contains("I will"));
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_auto_compaction_during_reply() -> Result<()> {
     let temp_dir = TempDir::new()?;

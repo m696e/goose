@@ -65,14 +65,27 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
                 GooseEffect::CompactConversation {
                     conversation,
                     usage: replacement_usage,
+                    event,
                 } => {
                     if let Some(provider_usage) = replacement_usage {
                         usage::record(self, session, provider_usage, true).await?;
                     }
-                    self.save_compacted_conversation(&session.id, conversation)
+                    self.save_compacted_conversation(&session.id, conversation, event)
                         .await?;
                     self.update(&session.id)
                         .usage(usage::estimate_context(conversation).await?)
+                        .apply()
+                        .await?;
+                }
+                GooseEffect::ClearConversation { destroy, event } => {
+                    if *destroy {
+                        self.replace_conversation(&session.id, &Conversation::default())
+                            .await?;
+                    } else {
+                        self.archive_conversation(&session.id, event).await?;
+                    }
+                    self.update(&session.id)
+                        .usage(usage::estimate_context(&Conversation::default()).await?)
                         .apply()
                         .await?;
                 }
@@ -141,6 +154,10 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
                 ))
                 | GooseEffect::CompactConversation { conversation, .. } => {
                     emit.emit(AgentEvent::HistoryReplaced(conversation.clone()))
+                        .await;
+                }
+                GooseEffect::ClearConversation { .. } => {
+                    emit.emit(AgentEvent::HistoryReplaced(Conversation::empty()))
                         .await;
                 }
                 GooseEffect::RecordUsage(usage) => {
@@ -245,6 +262,7 @@ mod tests {
     use super::*;
     use crate::config::GooseMode;
     use crate::conversation::message::Message;
+    use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
     use crate::session::session_manager::SessionType;
 
     #[tokio::test]
@@ -289,7 +307,18 @@ mod tests {
                 .agent_only(),
         );
         manager
-            .save_compacted_conversation(&session.id, &compacted)
+            .save_compacted_conversation(
+                &session.id,
+                &compacted,
+                &CompactionEvent::new(
+                    CompactionTrigger::Manual,
+                    None,
+                    &snapshot.conversation.clone().unwrap(),
+                    &compacted,
+                    None,
+                    None,
+                ),
+            )
             .await
             .unwrap();
 

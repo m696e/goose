@@ -36,9 +36,9 @@ use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::ops_recipe;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
-    persist_tool_confirmation_decision, run_goose, subagent_cancelled_message, BangShellOperation,
-    CompactionOperation, DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation,
-    ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
+    persist_tool_confirmation_decision, run_goose, ArchiveOperation, subagent_cancelled_message,
+    BangShellOperation, CompactionOperation, DoctorOperation, Emitter, EntryHookOperation,
+    ExitOnErrorOperation, ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
     GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation, Operation, ProjectOperation,
     RecipeOperation, RequestSizeOperation, RetryOperation, SkillOperation, SlashCommandOperation,
     StateMachine, StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation,
@@ -69,6 +69,7 @@ use crate::scheduler_trait::SchedulerTrait;
 use crate::security::adversary_inspector::AdversaryInspector;
 use crate::security::egress_inspector::EgressInspector;
 use crate::security::security_inspector::SecurityInspector;
+use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use crate::session::{GoalState, Session, SessionManager, SessionNameUpdate};
 use crate::tool_inspection::ToolInspectionManager;
@@ -1780,8 +1781,13 @@ impl Agent {
             tool_inspection_manager: &self.tool_inspection_manager,
             context_limit,
         };
-        let status_operation =
-            Arc::new(StatusOperation::new(provider.clone(), model_config.clone()));
+        let status_operation = Arc::new(StatusOperation::new(
+            provider.clone(),
+            model_config.clone(),
+            self.config.session_manager.clone(),
+        ));
+        let archive_operation =
+            Arc::new(ArchiveOperation::new(self.config.session_manager.clone()));
         let inference_provider = Arc::new(GooseInferenceProvider::new(provider));
         let inference = Arc::new(
             InferenceRunner::new(inference_provider, model_config)
@@ -1789,6 +1795,7 @@ impl Agent {
         );
         let mut command_handlers = operations.clone();
         command_handlers.push(status_operation);
+        command_handlers.push(archive_operation);
         let command_operation: Arc<dyn Operation<Session, GooseEffect> + '_> =
             Arc::new(SlashCommandOperation::new(command_handlers));
         let operations: Vec<_> =
@@ -2348,7 +2355,7 @@ impl Agent {
                 // Check if this was a command that modifies conversation history
                 let modifies_history = crate::agents::execute_commands::COMPACT_TRIGGERS
                     .contains(&message_text.trim())
-                    || message_text.trim() == "/clear";
+                    || matches!(message_text.trim(), "/clear" | "/clear --destroy");
 
                 return Ok(Box::pin(async_stream::try_stream! {
                     yield AgentEvent::Message(user_message);
@@ -2477,11 +2484,19 @@ impl Agent {
                 .await
                 {
                     Ok(compaction) => {
-                        let compacted_conversation = compaction.conversation;
-                        session_manager.replace_conversation(&session_config.id, &compacted_conversation).await?;
+                        let compacted = crate::session::compaction_event::ensure_message_ids(compaction.conversation);
+                        let event = CompactionEvent::new(
+                            CompactionTrigger::Threshold,
+                            None,
+                            &conversation_to_compact,
+                            &compacted,
+                            session.usage.total_tokens,
+                            Some(compaction.retained_context_tokens),
+                        );
+                        session_manager.save_compacted_conversation(&session_config.id, &compacted, &event).await?;
                         self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &compaction.usage, Some(compaction.retained_context_tokens)).await?;
 
-                        yield AgentEvent::HistoryReplaced(compacted_conversation.clone());
+                        yield AgentEvent::HistoryReplaced(compacted.clone());
 
                         yield AgentEvent::Message(
                             Message::assistant().with_system_notification(
@@ -2490,7 +2505,7 @@ impl Agent {
                             )
                         );
 
-                        compacted_conversation
+                        compacted
                     }
                     Err(e) => {
                         yield AgentEvent::Message(
@@ -3405,9 +3420,18 @@ impl Agent {
                             .await
                             {
                                 Ok(compaction) => {
-                                    session_manager.replace_conversation(&session_config.id, &compaction.conversation).await?;
+                                    let compacted = crate::session::compaction_event::ensure_message_ids(compaction.conversation);
+                                    let event = CompactionEvent::new(
+                                        CompactionTrigger::Recovery,
+                                        None,
+                                        &conversation,
+                                        &compacted,
+                                        session.usage.total_tokens,
+                                        Some(compaction.retained_context_tokens),
+                                    );
+                                    session_manager.save_compacted_conversation(&session_config.id, &compacted, &event).await?;
                                     self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &compaction.usage, Some(compaction.retained_context_tokens)).await?;
-                                    conversation = compaction.conversation;
+                                    conversation = compacted;
                                     did_recovery_compact_this_iteration = true;
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                     break;

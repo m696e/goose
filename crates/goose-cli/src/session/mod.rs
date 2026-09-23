@@ -718,9 +718,9 @@ impl CliSession {
                 history.save(editor);
                 self.handle_model(options).await?;
             }
-            InputResult::Clear => {
+            InputResult::Clear(destroy) => {
                 history.save(editor);
-                self.handle_clear().await?;
+                self.handle_clear(destroy).await?;
             }
             InputResult::New => {
                 history.save(editor);
@@ -1055,51 +1055,19 @@ impl CliSession {
         Ok(())
     }
 
-    async fn handle_clear(&mut self) -> Result<()> {
-        let provider = self.agent.provider(&self.session_id).await?;
-        if provider.manages_own_context() {
-            output::render_error(&context_management_unsupported_message(
-                "clear",
-                provider.get_name(),
-            ));
-            return Ok(());
-        }
-
-        if let Err(e) = self
-            .agent
-            .config
-            .session_manager
-            .replace_conversation(&self.session_id, &Conversation::default())
-            .await
-        {
-            output::render_error(&format!("Failed to clear session: {}", e));
-            return Ok(());
-        }
-
-        if let Err(e) = self
-            .agent
-            .config
-            .session_manager
-            .update(&self.session_id)
-            .usage(goose_providers::conversation::token_usage::Usage::new(
-                Some(0),
-                Some(0),
-                Some(0),
-            ))
-            .apply()
-            .await
-        {
-            output::render_error(&format!("Failed to reset token counts: {}", e));
-            return Ok(());
-        }
-
-        self.messages.clear();
-        tracing::info!("Chat context cleared by user.");
-        output::render_message(
-            &Message::assistant().with_text("Chat context cleared.\n"),
-            self.debug,
-        );
-        Ok(())
+    async fn handle_clear(&mut self, destroy: bool) -> Result<()> {
+        let command = if destroy {
+            "/clear --destroy"
+        } else {
+            "/clear"
+        };
+        self.push_message(Message::user().with_text(command));
+        output::show_thinking();
+        let result = self
+            .process_agent_response(true, CancellationToken::default())
+            .await;
+        output::hide_thinking();
+        result
     }
 
     async fn handle_new(&mut self) -> Result<()> {

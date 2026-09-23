@@ -7,6 +7,7 @@ use crate::providers::base::CostSource;
 use crate::providers::base::Provider;
 use crate::recipe::validate_recipe::strip_unreferenced_parameters;
 use crate::recipe::Recipe;
+use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
 use crate::session::export_markdown::export_session_to_markdown;
 use crate::session::extension_data::{ExtensionData, ExtensionState};
 use crate::session::session_naming::{
@@ -193,6 +194,160 @@ pub struct SessionInsights {
 pub struct SessionUsageTotals {
     pub accumulated_usage: Usage,
     pub accumulated_cost: Option<f64>,
+}
+
+/// One archived-history record as it is stored, with its row id and time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredCompactionEvent {
+    pub id: i64,
+    pub created_at: String,
+    pub event: CompactionEvent,
+}
+
+/// A one-line description of what a session has archived, for /status.
+pub fn archive_summary(events: &[StoredCompactionEvent]) -> Option<String> {
+    let last = events.last()?;
+    let messages: usize = events
+        .iter()
+        .map(|stored| stored.event.archived_message_count())
+        .sum();
+    let reason = last
+        .event
+        .reason
+        .as_deref()
+        .map(|reason| format!(", {reason}"))
+        .unwrap_or_default();
+
+    Some(format!(
+        "- Archived history: {} message(s) in {} event(s) (last: {} at {}{})",
+        messages,
+        events.len(),
+        last.event.trigger.as_str(),
+        last.created_at,
+        reason
+    ))
+}
+
+/// Render `/archive` for a session: the list of archiving events, or the
+/// messages one of them took away.
+pub async fn archive_report(
+    manager: &SessionManager,
+    session_id: &str,
+    params: &str,
+) -> Result<String> {
+    const MAX_MESSAGE_CHARS: usize = 2_000;
+    const MAX_DUMP_CHARS: usize = 60_000;
+
+    let events = manager.list_compaction_events(session_id).await?;
+    if events.is_empty() {
+        return Ok(
+            "No archived history: nothing has been compacted or cleared in this session."
+                .to_string(),
+        );
+    }
+
+    let params = params.trim();
+    if params.is_empty() {
+        let mut lines = vec![format!("**Archived history**: {} event(s)", events.len())];
+        for stored in &events {
+            let reason = stored
+                .event
+                .reason
+                .as_deref()
+                .map(|reason| format!(" — {reason}"))
+                .unwrap_or_default();
+            let context = match (stored.event.before_tokens, stored.event.after_tokens) {
+                (Some(before), Some(after)) => format!(" — {before} → {after} tokens"),
+                _ => String::new(),
+            };
+            lines.push(format!(
+                "- `{}` {} · {} · {} message(s){}{}",
+                stored.id,
+                stored.created_at,
+                stored.event.trigger.as_str(),
+                stored.event.archived_message_count(),
+                context,
+                reason,
+            ));
+        }
+        lines.push(String::new());
+        lines
+            .push("Read one event's messages with `/archive <id>` or `/archive last`.".to_string());
+        return Ok(lines.join("\n"));
+    }
+
+    let selected = if params.eq_ignore_ascii_case("last") {
+        events.last()
+    } else {
+        match params.parse::<i64>() {
+            Ok(id) => events.iter().find(|stored| stored.id == id),
+            Err(_) => None,
+        }
+    };
+    let Some(selected) = selected else {
+        return Ok(format!(
+            "No such archive event: `{params}`. Run `/archive` to list them."
+        ));
+    };
+
+    let conversation = manager
+        .get_session(session_id, true)
+        .await?
+        .conversation
+        .unwrap_or_default();
+    let mut body = Vec::new();
+    let mut budget = MAX_DUMP_CHARS;
+    let mut shown = 0usize;
+    for id in &selected.event.archived_message_ids {
+        let Some(message) = conversation
+            .messages()
+            .iter()
+            .find(|message| message.id.as_deref() == Some(id.as_str()))
+        else {
+            continue;
+        };
+        let text = message.as_concat_text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let truncated = text.chars().count() > MAX_MESSAGE_CHARS;
+        let text: String = text.chars().take(MAX_MESSAGE_CHARS).collect();
+        let entry = format!(
+            "**{}**{}\n\n{}",
+            match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            },
+            if truncated { " (truncated)" } else { "" },
+            text
+        );
+        if entry.len() > budget {
+            body.push("… archive truncated".to_string());
+            break;
+        }
+        budget -= entry.len();
+        shown += 1;
+        body.push(entry);
+    }
+
+    let header = format!(
+        "**Archive `{}`** · {} · {}{}\n\n",
+        selected.id,
+        selected.created_at,
+        selected.event.trigger.as_str(),
+        selected
+            .event
+            .reason
+            .as_deref()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default(),
+    );
+    let footer = format!(
+        "\n\n_showing {shown} of {} archived message(s)_",
+        selected.event.archived_message_count()
+    );
+
+    Ok(format!("{header}{}{footer}", body.join("\n\n---\n\n")))
 }
 
 impl<'a> SessionUpdateBuilder<'a> {
@@ -491,14 +646,25 @@ impl SessionManager {
         self.storage.replace_conversation(id, conversation).await
     }
 
-    pub(crate) async fn save_compacted_conversation(
+    pub async fn save_compacted_conversation(
         &self,
         id: &str,
         conversation: &Conversation,
+        event: &CompactionEvent,
     ) -> Result<()> {
         self.storage
-            .save_compacted_conversation(id, conversation)
+            .save_compacted_conversation(id, conversation, event)
             .await
+    }
+
+    /// Take the whole conversation away from the agent without deleting it:
+    /// every stored message becomes agent-invisible but stays on record.
+    pub async fn archive_conversation(&self, id: &str, event: &CompactionEvent) -> Result<()> {
+        self.storage.archive_conversation(id, event).await
+    }
+
+    pub async fn list_compaction_events(&self, id: &str) -> Result<Vec<StoredCompactionEvent>> {
+        self.storage.list_compaction_events(id).await
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -1208,6 +1374,7 @@ impl SessionStorage {
         )
         .execute(&mut *tx)
         .await?;
+        Self::create_compaction_events_table(&mut tx).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
             .execute(&mut *tx)
             .await?;
@@ -1737,6 +1904,9 @@ impl SessionStorage {
                 .execute(&mut **tx)
                 .await?;
             }
+            18 => {
+                Self::create_compaction_events_table(tx).await?;
+            }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
             }
@@ -2136,6 +2306,48 @@ impl SessionStorage {
         Ok(())
     }
 
+    async fn create_compaction_events_table(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS compaction_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                trigger TEXT NOT NULL,
+                reason TEXT,
+                before_tokens INTEGER,
+                after_tokens INTEGER,
+                archived_message_ids TEXT NOT NULL DEFAULT '[]'
+            )",
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_compaction_events_session ON compaction_events(session_id)",
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_compaction_event(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        session_id: &str,
+        event: &CompactionEvent,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO compaction_events (session_id, trigger, reason, before_tokens, after_tokens, archived_message_ids) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(event.trigger.as_str())
+        .bind(event.reason.as_deref())
+        .bind(event.before_tokens)
+        .bind(event.after_tokens)
+        .bind(serde_json::to_string(&event.archived_message_ids)?)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     async fn replace_conversation_inner(
         pool: &Pool<Sqlite>,
         session_id: &str,
@@ -2189,6 +2401,7 @@ impl SessionStorage {
         &self,
         session_id: &str,
         conversation: &Conversation,
+        event: &CompactionEvent,
     ) -> Result<()> {
         let pool = self.pool().await?;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -2233,12 +2446,103 @@ impl SessionStorage {
             }
         }
 
+        Self::insert_compaction_event(&mut tx, session_id, event).await?;
+
         sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Take every message in the session away from the agent, keeping the rows.
+    async fn archive_conversation(&self, session_id: &str, event: &CompactionEvent) -> Result<()> {
+        let pool = self.pool().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT message_id, metadata_json FROM messages WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (message_id, metadata_json) in rows {
+            let mut metadata = metadata_json
+                .and_then(|json| serde_json::from_str::<MessageMetadata>(&json).ok())
+                .unwrap_or_default();
+            if !metadata.agent_visible {
+                continue;
+            }
+            metadata.agent_visible = false;
+            sqlx::query(
+                "UPDATE messages SET metadata_json = ? WHERE session_id = ? AND message_id = ?",
+            )
+            .bind(serde_json::to_string(&metadata)?)
+            .bind(session_id)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        Self::insert_compaction_event(&mut tx, session_id, event).await?;
+
+        sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_compaction_events(&self, session_id: &str) -> Result<Vec<StoredCompactionEvent>> {
+        let pool = self.pool().await?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<i32>,
+                Option<i32>,
+                String,
+            ),
+        >(
+            "SELECT id, strftime('%Y-%m-%d %H:%M:%S', created_at), trigger, reason, before_tokens, after_tokens, archived_message_ids \
+             FROM compaction_events WHERE session_id = ? ORDER BY id",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    created_at,
+                    trigger,
+                    reason,
+                    before_tokens,
+                    after_tokens,
+                    archived_message_ids,
+                )| StoredCompactionEvent {
+                    id,
+                    created_at,
+                    event: CompactionEvent {
+                        trigger: CompactionTrigger::parse(&trigger)
+                            .unwrap_or(CompactionTrigger::Manual),
+                        reason,
+                        before_tokens,
+                        after_tokens,
+                        archived_message_ids: serde_json::from_str(&archived_message_ids)
+                            .unwrap_or_default(),
+                    },
+                },
+            )
+            .collect())
     }
 
     async fn list_sessions_matching(&self, query: SessionListQuery<'_>) -> Result<Vec<Session>> {
@@ -3055,6 +3359,147 @@ mod tests {
 
     const NUM_CONCURRENT_SESSIONS: i32 = 10;
     const GENERATED_SESSION_NAME: &str = "Generated session name";
+
+    async fn session_with_one_message(manager: &SessionManager) -> Session {
+        use crate::config::GooseMode;
+        use crate::session::session_manager::SessionType;
+
+        let session = manager
+            .create_session(
+                PathBuf::from("/tmp"),
+                "archive".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        manager
+            .add_message(
+                &session.id,
+                &Message::user().with_id("keep").with_text("hello"),
+            )
+            .await
+            .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn archiving_keeps_the_messages_on_record_and_records_the_event() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_with_one_message(&manager).await;
+
+        let before = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        let event = CompactionEvent::new(
+            CompactionTrigger::Clear,
+            None,
+            &before,
+            &Conversation::empty(),
+            Some(120),
+            Some(0),
+        );
+        manager
+            .archive_conversation(&session.id, &event)
+            .await
+            .unwrap();
+
+        let stored = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(stored.messages().len(), 1);
+        assert_eq!(stored.messages()[0].as_concat_text(), "hello");
+        assert!(!stored.messages()[0].is_agent_visible());
+        assert!(stored.messages()[0].is_user_visible());
+
+        let events = manager.list_compaction_events(&session.id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.trigger, CompactionTrigger::Clear);
+        assert_eq!(events[0].event.archived_message_ids, vec!["keep"]);
+        assert!(archive_summary(&events).unwrap().contains("1 message(s)"));
+    }
+
+    #[tokio::test]
+    async fn replacing_the_conversation_still_deletes_the_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_with_one_message(&manager).await;
+
+        manager
+            .replace_conversation(&session.id, &Conversation::empty())
+            .await
+            .unwrap();
+
+        let stored = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert!(stored.messages().is_empty());
+        assert!(manager
+            .list_compaction_events(&session.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn compaction_hides_the_messages_it_summarized_and_records_them() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_with_one_message(&manager).await;
+
+        let before = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        let mut after = before.clone();
+        after.messages_mut()[0].metadata.agent_visible = false;
+        after.messages_mut().push(
+            Message::assistant()
+                .with_id("summary")
+                .with_text("summary")
+                .agent_only(),
+        );
+        let event = CompactionEvent::new(
+            CompactionTrigger::Threshold,
+            None,
+            &before,
+            &after,
+            Some(500),
+            Some(10),
+        );
+        manager
+            .save_compacted_conversation(&session.id, &after, &event)
+            .await
+            .unwrap();
+
+        let stored = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(stored.messages().len(), 2);
+        assert!(!stored.messages()[0].is_agent_visible());
+        assert!(stored.messages()[1].is_agent_visible());
+
+        let events = manager.list_compaction_events(&session.id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.trigger, CompactionTrigger::Threshold);
+        assert_eq!(events[0].event.archived_message_ids, vec!["keep"]);
+        assert_eq!(events[0].event.before_tokens, Some(500));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

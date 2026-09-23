@@ -24,7 +24,7 @@ pub enum InputResult {
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
     Model(ModelCommandOptions),
-    Clear,
+    Clear(bool),
     New,
     Compact,
     ToggleFullToolOutput,
@@ -321,7 +321,8 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 }))
             }
         }
-        s if s == CMD_CLEAR => Some(InputResult::Clear),
+        s if s == CMD_CLEAR => Some(InputResult::Clear(false)),
+        "/clear --destroy" => Some(InputResult::Clear(true)),
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
@@ -437,7 +438,8 @@ fn help_text() -> String {
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
 /? or /help - Display this help message
-/clear - Clears the current chat history
+/clear - Clears the current chat history, keeping it archived
+/clear --destroy - Clears the current chat history and deletes it
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
 
 Navigation:
