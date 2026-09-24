@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -1949,6 +1949,20 @@ impl SessionStorage {
             }
             19 => {
                 Self::add_compaction_event_carry_column(tx).await?;
+            }
+            20 => {
+                // Databases that recorded a version 17 before this arm existed
+                // (this branch used 17 for its own migration before rebasing onto
+                // the fix that introduced the index in that slot) have already
+                // been stamped past v17, so v17's CREATE INDEX never runs for
+                // them. Re-ensure the index under a fresh version so those
+                // databases recover instead of holding the write lock for
+                // minutes on every large compaction.
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_session_message ON messages(session_id, message_id)",
+                )
+                .execute(&mut **tx)
+                .await?;
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
@@ -5555,6 +5569,56 @@ mod tests {
         assert!(
             index_exists,
             "migrating to v18 should create idx_messages_session_message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_session_message_index_migration_after_version_collision() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join(SESSIONS_FOLDER).join(DB_NAME);
+
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+
+        SessionStorage::create_schema(&pool).await.unwrap();
+
+        // A branch that used schema version 17 for a different migration can
+        // leave a database stamped at 19 with no (session_id, message_id)
+        // index, because v17 is already recorded and is never re-run.
+        sqlx::query("DROP INDEX idx_messages_session_message")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 19")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        pool.close().await;
+
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let pool = sm.storage().pool().await.unwrap(); // Triggers migration
+
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_session_message')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        assert!(
+            index_exists,
+            "a database stamped past v17 without the index must still get idx_messages_session_message"
         );
     }
 
