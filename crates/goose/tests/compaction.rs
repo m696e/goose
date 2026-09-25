@@ -729,6 +729,45 @@ async fn a_permitted_compaction_request_compacts_at_the_next_boundary() -> Resul
     Ok(())
 }
 
+/// The size a compaction left behind is on record, which is what lets a repeat
+/// of the prompt it carried forward be refused instead of re-summarizing the
+/// summary it just wrote.
+#[tokio::test]
+async fn an_applied_compaction_records_the_size_it_left_behind() -> Result<()> {
+    use goose::agents::session_requests::SessionRequestState;
+
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+    let session =
+        setup_test_session(&agent, &temp_dir, "recorded-size", four_message_history()).await?;
+    agent
+        .update_provider(
+            Arc::new(MockCompactionProvider::new()),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    set_pending_compaction_request(&agent, &session, "the first exchange is done", true).await;
+    run_command(&agent, &session, "carry on").await?;
+
+    let session_data = agent
+        .config
+        .session_manager
+        .get_session(&session.id, false)
+        .await?;
+    let state = SessionRequestState::read(&session_data);
+    assert!(
+        state
+            .last_applied_context_tokens
+            .is_some_and(|tokens| tokens > 0),
+        "the applied compaction must record the context size it left, got {:?}",
+        state.last_applied_context_tokens
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_carried_note_survives_the_compaction_verbatim() -> Result<()> {
     let temp_dir = TempDir::new()?;

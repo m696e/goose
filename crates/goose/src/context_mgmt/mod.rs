@@ -56,6 +56,33 @@ pub struct CompactionResult {
     pub retained_context_tokens: i32,
 }
 
+/// Whether a message is the user prompt a compaction carries forward: the most
+/// recent agent-visible, text-only user message that is not a turn-context
+/// event. `compact_messages` re-appends that prompt after the summary, so a
+/// mid-turn compaction does not lose the request it is compacting for; the
+/// request policy uses the same rule to recognise a carried prompt.
+pub(crate) fn is_preservable_prompt(message: &Message) -> bool {
+    if !message.is_agent_visible()
+        || message.is_turn_context()
+        || !matches!(message.role, rmcp::model::Role::User)
+    {
+        return false;
+    }
+
+    let projected = message.agent_visible_content();
+    let has_text = projected
+        .content
+        .iter()
+        .any(|content| matches!(content, MessageContent::Text(_)));
+    let has_tool_content = projected.content.iter().any(|content| {
+        matches!(
+            content,
+            MessageContent::ToolRequest(_) | MessageContent::ToolResponse(_)
+        )
+    });
+    has_text && !has_tool_content
+}
+
 /// Compact messages by summarizing them
 ///
 /// This function performs the actual compaction by summarizing messages and updating
@@ -78,36 +105,15 @@ pub async fn compact_messages(
 
     let messages = conversation.messages();
 
-    let has_text_only = |msg: &Message| {
-        let has_text = msg
-            .content
-            .iter()
-            .any(|c| matches!(c, MessageContent::Text(_)));
-        let has_tool_content = msg.content.iter().any(|c| {
-            matches!(
-                c,
-                MessageContent::ToolRequest(_) | MessageContent::ToolResponse(_)
-            )
-        });
-        has_text && !has_tool_content
-    };
-
     // Turn-context events are agent-appended, never the message to preserve.
     let (preserved_user_message, preserved_idx, is_most_recent) = if !manual_compact {
         let found_msg = messages.iter().enumerate().rev().find_map(|(idx, msg)| {
-            if !msg.is_agent_visible()
-                || msg.is_turn_context()
-                || !matches!(msg.role, rmcp::model::Role::User)
-            {
+            if !is_preservable_prompt(msg) {
                 return None;
             }
 
-            let projected = msg.agent_visible_content();
-            if !has_text_only(&projected) {
-                return None;
-            }
-
-            let preserved = projected
+            let preserved = msg
+                .agent_visible_content()
                 .content
                 .into_iter()
                 .filter(|content| matches!(content, MessageContent::Text(_)))

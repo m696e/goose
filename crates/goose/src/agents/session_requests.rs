@@ -9,8 +9,10 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::capabilities::{SessionPermissions, SESSION_MODIFICATION};
+use crate::context_mgmt::count_context_tokens;
 use crate::conversation::message::{Message, SystemNotificationType};
 use crate::conversation::Conversation;
 use crate::session::extension_data::{ExtensionData, ExtensionState};
@@ -19,6 +21,13 @@ use crate::session::Session;
 /// Below this there is nothing worth compressing: the summary and its
 /// continuation would replace fewer messages than they are worth.
 pub const MIN_AGENT_VISIBLE_MESSAGES_TO_COMPACT: usize = 4;
+
+/// A compaction carries the prompt it was asked for into the conversation it
+/// produces, so the model sees that same request again as soon as the summary
+/// lands and would ask for the compaction again. A repeat is only carried out
+/// once the context has grown by what another summary costs, which is on the
+/// order of the size the last compaction left behind and never less than this.
+pub const MIN_CONTEXT_GROWTH_TO_COMPACT: i32 = 4_096;
 
 /// A note the model carries across a compaction adds to the context it just
 /// paid to shrink, so it is bounded rather than silently truncated.
@@ -46,6 +55,12 @@ pub struct SessionRequestState {
     pub requested_compaction_count: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub applied_compaction_count: u32,
+    /// Size of the context the last applied compaction produced, which is on the
+    /// order of what a summary of it costs. A request that arrives before the
+    /// context has grown by at least that much would summarize the conversation
+    /// that compaction just produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_context_tokens: Option<i32>,
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -95,10 +110,11 @@ impl SessionRequestState {
         self.denied_compaction = Some(request);
     }
 
-    pub fn mark_applied(&mut self, request: &CompactionRequest) {
+    pub fn mark_applied(&mut self, request: &CompactionRequest, retained_context_tokens: i32) {
         self.pending_compaction = None;
         self.denied_compaction = None;
         self.applied_compaction_count = self.applied_compaction_count.saturating_add(1);
+        self.last_applied_context_tokens = Some(retained_context_tokens);
         let _ = request;
     }
 }
@@ -115,7 +131,7 @@ pub enum CompactionDecision {
     Apply,
 }
 
-pub fn decide(session: &Session, conversation: &Conversation) -> CompactionDecision {
+pub async fn decide(session: &Session, conversation: &Conversation) -> CompactionDecision {
     if !session_modification_permitted(session) {
         return CompactionDecision::Denied;
     }
@@ -127,7 +143,46 @@ pub fn decide(session: &Session, conversation: &Conversation) -> CompactionDecis
         ));
     }
 
+    // A compaction replaces the history but carries the prompt it was asked for
+    // into the result, where the model reads it as the outstanding request and
+    // asks for the same compaction again. Each pass then pays for a summary that
+    // the next pass immediately re-summarizes. Refuse that repeat until the
+    // context has grown enough for another summary to be worth its call, or the
+    // user has sent something new.
+    if let Some(last) = SessionRequestState::read(session).last_applied_context_tokens {
+        if outstanding_prompt_is_carried(conversation) {
+            // A summary of this conversation is on the order of the size the
+            // last compaction left behind, so another one cannot free much until
+            // the context has grown by at least that — and by at least
+            // MIN_CONTEXT_GROWTH_TO_COMPACT, so a conversation small enough to
+            // grow that far within a turn cannot loop on small additions.
+            let growth_needed = last.max(MIN_CONTEXT_GROWTH_TO_COMPACT);
+            match count_context_tokens(conversation.messages()).await {
+                Ok(current) if current.saturating_sub(last) < growth_needed => {
+                    return CompactionDecision::Refused(format!(
+                        "the context has not grown since the last compaction \
+                         ({current} tokens, {last} when it was compacted)"
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => warn!("Could not measure the context, allowing compaction: {error}"),
+            }
+        }
+    }
+
     CompactionDecision::Apply
+}
+
+/// Whether the outstanding prompt is one a compaction carried forward — an
+/// agent-only copy — rather than a message the user has just sent. A user-visible
+/// prompt means the user has spoken since, and that request is theirs to make.
+fn outstanding_prompt_is_carried(conversation: &Conversation) -> bool {
+    conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| crate::context_mgmt::is_preservable_prompt(message))
+        .is_some_and(|message| !message.is_user_visible())
 }
 
 /// The note the model asked to keep, as a message in the compacted
@@ -221,6 +276,7 @@ pub fn refusal_message(detail: &str) -> Message {
 mod tests {
     use super::*;
     use crate::config::GooseMode;
+    use crate::conversation::message::MessageMetadata;
     use crate::session::session_manager::SessionType;
     use rmcp::model::Role;
 
@@ -269,7 +325,7 @@ mod tests {
         let (session, _tmp) = session(false).await;
 
         assert!(matches!(
-            decide(&session, &conversation_of(10)),
+            decide(&session, &conversation_of(10)).await,
             CompactionDecision::Denied
         ));
     }
@@ -279,11 +335,139 @@ mod tests {
         let (session, _tmp) = session(true).await;
 
         assert!(matches!(
-            decide(&session, &conversation_of(2)),
+            decide(&session, &conversation_of(2)).await,
             CompactionDecision::Refused(_)
         ));
         assert!(matches!(
-            decide(&session, &conversation_of(10)),
+            decide(&session, &conversation_of(10)).await,
+            CompactionDecision::Apply
+        ));
+    }
+
+    /// The conversation a compaction produces: the summary, the continuation
+    /// that tells the model to carry on, the prompt the compaction carried
+    /// forward, and the note it kept.
+    fn conversation_after_a_compaction(prompt_user_visible: bool) -> Conversation {
+        let mut prompt = Message::user()
+            .with_id("prompt")
+            .with_text("update the client and compact");
+        if !prompt_user_visible {
+            prompt = prompt.with_metadata(MessageMetadata::agent_only());
+        }
+
+        Conversation::new_unvalidated(vec![
+            Message::user()
+                .with_id("summary")
+                .with_text("# Conversation Summary")
+                .with_metadata(MessageMetadata::agent_only()),
+            Message::assistant()
+                .with_id("continuation")
+                .with_text("Your context was compacted.")
+                .with_metadata(MessageMetadata::agent_only()),
+            prompt,
+            Message::assistant()
+                .with_id("carry")
+                .with_text("Note kept verbatim across the compaction: ..."),
+        ])
+    }
+
+    /// The task carrying on, which is what the context does under the prompt a
+    /// compaction carried forward.
+    fn with_work(mut conversation: Conversation, chars: usize) -> Conversation {
+        conversation.push(
+            Message::assistant()
+                .with_id("work")
+                .with_text("step output ".repeat(chars / 12)),
+        );
+        conversation
+    }
+
+    async fn session_compacted_at(tokens: i32) -> (Session, tempfile::TempDir) {
+        let (mut session, temp_dir) = session(true).await;
+        let mut state = SessionRequestState::read(&session);
+        state.last_applied_context_tokens = Some(tokens);
+        state.write_into(&mut session.extension_data).unwrap();
+        (session, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn a_repeat_of_the_prompt_the_last_compaction_carried_is_refused() {
+        let conversation = conversation_after_a_compaction(false);
+        let tokens = count_context_tokens(conversation.messages()).await.unwrap();
+        let (session, _tmp) = session_compacted_at(tokens).await;
+
+        assert!(
+            matches!(
+                decide(&session, &conversation).await,
+                CompactionDecision::Refused(_)
+            ),
+            "a request against the conversation the last compaction produced must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_with_only_a_turn_of_new_context_is_refused() {
+        let conversation = conversation_after_a_compaction(false);
+        let tokens = count_context_tokens(conversation.messages()).await.unwrap();
+        let (session, _tmp) = session_compacted_at(tokens).await;
+        // The verify-and-ask turn the model adds between compactions.
+        let conversation = with_work(conversation, 12_000);
+
+        assert!(
+            matches!(
+                decide(&session, &conversation).await,
+                CompactionDecision::Refused(_)
+            ),
+            "a turn's worth of context is not enough to pay for another summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_is_applied_once_the_context_has_grown() {
+        let base = conversation_after_a_compaction(false);
+        let tokens = count_context_tokens(base.messages()).await.unwrap();
+        let (session, _tmp) = session_compacted_at(tokens).await;
+        let conversation = with_work(base, 48_000);
+
+        let grown = count_context_tokens(conversation.messages()).await.unwrap();
+        assert!(
+            grown - tokens >= MIN_CONTEXT_GROWTH_TO_COMPACT,
+            "the fixture must grow past the bar to be worth asserting on: {tokens} -> {grown}"
+        );
+        assert!(matches!(
+            decide(&session, &conversation).await,
+            CompactionDecision::Apply
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_repeat_is_refused_until_the_context_regrows_past_what_it_left() {
+        // A compaction that left a large context: a summary of it is on the
+        // order of that size, so a turn of new context cannot pay for another.
+        let conversation = with_work(conversation_after_a_compaction(false), 48_000);
+        let tokens = count_context_tokens(conversation.messages()).await.unwrap();
+        let (session, _tmp) = session_compacted_at(tokens).await;
+
+        assert!(matches!(
+            decide(&session, &conversation).await,
+            CompactionDecision::Refused(_)
+        ));
+
+        let (session, _tmp) = session_compacted_at(tokens / 4).await;
+        assert!(matches!(
+            decide(&session, &conversation).await,
+            CompactionDecision::Apply
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_user_has_just_sent_is_applied_without_growth() {
+        let conversation = conversation_after_a_compaction(true);
+        let tokens = count_context_tokens(conversation.messages()).await.unwrap();
+        let (session, _tmp) = session_compacted_at(tokens).await;
+
+        assert!(matches!(
+            decide(&session, &conversation).await,
             CompactionDecision::Apply
         ));
     }
@@ -300,6 +484,7 @@ mod tests {
             denied_compaction: None,
             requested_compaction_count: 3,
             applied_compaction_count: 1,
+            last_applied_context_tokens: Some(4_321),
         };
 
         state.write_into(&mut extension_data).unwrap();

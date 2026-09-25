@@ -836,7 +836,7 @@ impl Agent {
             return Ok(None);
         };
 
-        match decide(&session, conversation) {
+        match decide(&session, conversation).await {
             CompactionDecision::Denied => {
                 state.defer_denied(request.clone());
                 state.persist(session_manager, session_id).await?;
@@ -892,7 +892,7 @@ impl Agent {
                             Some(result.retained_context_tokens),
                         )
                         .await?;
-                        state.mark_applied(&request);
+                        state.mark_applied(&request, result.retained_context_tokens);
                         state.persist(session_manager, session_id).await?;
                         *conversation = compacted;
                         Ok(Some(

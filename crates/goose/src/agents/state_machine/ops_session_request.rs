@@ -66,7 +66,7 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
             return not_applicable();
         };
 
-        match decide(session, conversation) {
+        match decide(session, conversation).await {
             CompactionDecision::Denied => {
                 state.defer_denied(request.clone());
                 let notice = emit.message(denied_notice(&request)).await;
@@ -118,7 +118,7 @@ impl Operation<Session, GooseEffect> for SessionRequestOperation {
                                 event.archived_message_count(),
                             ))
                             .await;
-                        state.mark_applied(&request);
+                        state.mark_applied(&request, result.retained_context_tokens);
 
                         let mut extension_data = session.extension_data.clone();
                         state.write_into(&mut extension_data)?;
