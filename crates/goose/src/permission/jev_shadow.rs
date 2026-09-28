@@ -54,8 +54,23 @@ pub struct JevVerdict {
 
 pub fn shadow_enabled() -> bool {
     Config::global()
-        .get_param::<bool>(JEV_SHADOW_CONFIG_KEY)
+        .get_param::<Value>(JEV_SHADOW_CONFIG_KEY)
+        .map(|value| parse_switch(&value))
         .unwrap_or(false)
+}
+
+/// Switches are written in config.yaml as `true` but in the environment as
+/// `GOOSE_JEV_SHADOW=1`, which goose parses as a JSON number. Accept all three.
+fn parse_switch(value: &Value) -> bool {
+    match value {
+        Value::Bool(enabled) => *enabled,
+        Value::Number(number) => number.as_i64().map(|number| number != 0).unwrap_or(false),
+        Value::String(text) => matches!(
+            text.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => false,
+    }
 }
 
 /// The auto-approval rule. Anything below either bound is left to the human.
@@ -341,6 +356,29 @@ mod tests {
         assert_eq!(outcome(false, true), "shadow_deferred_judge_approved");
     }
 
+    #[test]
+    fn switch_accepts_the_way_env_and_yaml_spell_it() {
+        assert!(parse_switch(&json!(true)));
+        assert!(parse_switch(&json!(1)));
+        assert!(parse_switch(&json!("1")));
+        assert!(parse_switch(&json!("true")));
+        assert!(parse_switch(&json!("ON")));
+        assert!(!parse_switch(&json!(false)));
+        assert!(!parse_switch(&json!(0)));
+        assert!(!parse_switch(&json!("")));
+        assert!(!parse_switch(&json!({})));
+    }
+
+    #[test]
+    fn switch_reads_the_environment_as_the_cli_would_spell_it() {
+        std::env::set_var(JEV_SHADOW_CONFIG_KEY, "1");
+        assert!(shadow_enabled());
+        std::env::set_var(JEV_SHADOW_CONFIG_KEY, "false");
+        assert!(!shadow_enabled());
+        std::env::remove_var(JEV_SHADOW_CONFIG_KEY);
+        assert!(!shadow_enabled());
+    }
+
     /// A decisive probe of the whole path: config -> provider -> Jev -> verdicts.
     /// If the endpoint, model id or auth were wrong this returns an error; if it
     /// works, a listing must score higher on read-only than a destructive command.
@@ -374,5 +412,50 @@ mod tests {
             read_verdict.probability > write_verdict.probability,
             "a listing should score higher on read-only than a destructive command"
         );
+    }
+
+    /// Exercises the whole recording path against a real provider: build the
+    /// questions, call Jev, and write what it answered into the session database.
+    #[tokio::test]
+    #[ignore = "calls the network; run with OPENROUTER_API_KEY set"]
+    async fn live_shadow_writes_a_decision_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_manager = SessionManager::new(dir.path().to_path_buf());
+        let session_id = session_manager
+            .create_session(
+                std::path::PathBuf::from("/tmp"),
+                "jev shadow live".to_string(),
+                crate::session::SessionType::User,
+                crate::config::GooseMode::default(),
+            )
+            .await
+            .unwrap()
+            .id;
+
+        let read = request("r1", "developer__shell", "ls -la");
+        let write = request("r2", "developer__shell", "rm -rf /tmp/x");
+        let judge_read_only: HashSet<String> = ["r1".to_string()].into_iter().collect();
+
+        run_shadow(
+            &session_manager,
+            &session_id,
+            vec![&read, &write],
+            &judge_read_only,
+        )
+        .await;
+
+        let stored = session_manager
+            .list_jev_decisions(&session_id)
+            .await
+            .unwrap();
+        eprintln!("{stored:#?}");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|row| row.request_id == "r1"
+            && row.read_only
+            && row.outcome == "agreed_read_only"));
+        assert!(stored.iter().any(|row| row.request_id == "r2"
+            && !row.read_only
+            && row.judge_read_only == Some(false)));
+        assert!(stored.iter().all(|row| row.model == "typesafe/jev-1.13"));
     }
 }
