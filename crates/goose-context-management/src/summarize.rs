@@ -155,6 +155,14 @@ pub async fn summarize(
 
                 apply_structured_summary(&mut response, &templates.summary);
 
+                // The summary becomes the conversation's new context, so it
+                // carries no image: an attachment that outlived compaction would
+                // defeat the summarising and can exceed the next request's size
+                // limit by itself.
+                response
+                    .content
+                    .retain(|content| !matches!(content, MessageContent::Image(_)));
+
                 return Ok(Summary {
                     message: response,
                     usage,
@@ -187,6 +195,7 @@ mod tests {
     use crate::model::CompactionModel;
     use crate::templates::Templates;
     use async_trait::async_trait;
+    use goose_provider_types::conversation::token_usage::Usage;
     use rmcp::model::CallToolResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -218,6 +227,51 @@ mod tests {
                 "Prompt exceeds context limit".to_string(),
             ))
         }
+    }
+
+    struct ScriptedModel(Message);
+
+    #[async_trait]
+    impl CompactionModel for ScriptedModel {
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+        ) -> Result<(Message, ProviderUsage), ProviderError> {
+            Ok((
+                self.0.clone(),
+                ProviderUsage::new(String::new(), Usage::default()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_carries_no_image() {
+        // The summary becomes the whole of the conversation's new context, so
+        // anything visual in it would outlive the compaction that was meant to
+        // replace it — and a large attachment can exceed the next request's
+        // size limit on its own.
+        let model = ScriptedModel(
+            Message::assistant()
+                .with_text("### /tmp/panel.png\nPhoto evidence of the dead red bit.")
+                .with_image("aW1hZ2VieXRlcw==", "image/png"),
+        );
+        let messages = vec![Message::user().with_text("look at /tmp/panel.png")];
+
+        let summary = summarize(&model, None, &Templates::default(), &messages)
+            .await
+            .unwrap();
+
+        assert!(
+            !summary
+                .message
+                .content
+                .iter()
+                .any(|content| matches!(content, MessageContent::Image(_))),
+            "the summary must not carry an image: {:?}",
+            summary.message.content
+        );
+        assert!(summary.message.as_concat_text().contains("/tmp/panel.png"));
     }
 
     #[tokio::test]
