@@ -18,19 +18,26 @@ use rmcp::model::{
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::tool_execution::ToolCallContext;
 use crate::providers::decision_provider::decision_provider_from_config;
+use crate::session::JevDecisionRecord;
 
 pub static EXTENSION_NAME: &str = "jev";
 pub const ASK_TOOL_NAME: &str = "ask_jev";
+pub const STEER_TOOL_NAME: &str = "steer";
 
 /// Below this, the question is not well enough posed for the answer to mean much.
 pub const MIN_USEFUL_CONFIDENCE: f64 = 0.5;
+
+/// How far ahead the leader must be before a steer is worth giving. The spread
+/// is what tells a real ordering from a coin toss, and it never reaches the model.
+pub const MIN_STEER_MARGIN: f64 = 0.20;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -75,12 +82,91 @@ struct AskJevParams {
     context: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SteerCandidate {
+    /// A short label for the direction.
+    label: String,
+    /// What pursuing this direction means.
+    description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SteerParams {
+    /// What is being decided: the research question these directions answer.
+    question: String,
+    /// The directions you are choosing between, in your own words. At least two.
+    candidates: Vec<SteerCandidate>,
+    /// The label of the direction you would pursue on your own judgement, before
+    /// asking. Required: it is what makes the reply a change to your plan rather
+    /// than an instruction, and what lets the steer be checked afterwards.
+    prior: String,
+    /// Facts the ordering should be judged against. Everything it depends on must
+    /// be here; the model cannot ask follow-up questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+}
+
+/// What a distribution is allowed to do: move the agent off its stated prior, or
+/// nothing. There is deliberately no variant that returns the numbers.
+#[derive(Debug, PartialEq)]
+enum Steer {
+    Move(String),
+    NoSteer(NoSteerReason),
+}
+
+#[derive(Debug, PartialEq)]
+enum NoSteerReason {
+    /// Nothing separated the candidates.
+    NotDistinguishable,
+    /// The leader was already the stated prior.
+    AgreedWithPrior,
+}
+
+impl NoSteerReason {
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::NotDistinguishable => "no_steer_indistinguishable",
+            Self::AgreedWithPrior => "no_steer_agreed",
+        }
+    }
+}
+
+/// Consumes the distribution. The margin and the confidence stay here: they
+/// decide whether a steer happens and are never part of what the agent is told.
+fn steer_from(ranked: &[(String, f64)], confidence: f64, prior: &str) -> Result<Steer, String> {
+    let (leader, leader_probability) = ranked
+        .first()
+        .ok_or_else(|| "the decision model returned no distribution".to_string())?;
+    let runner_up = ranked
+        .get(1)
+        .map(|(_, probability)| *probability)
+        .unwrap_or(0.0);
+
+    if confidence < MIN_USEFUL_CONFIDENCE || leader_probability - runner_up < MIN_STEER_MARGIN {
+        return Ok(Steer::NoSteer(NoSteerReason::NotDistinguishable));
+    }
+    if leader == prior {
+        return Ok(Steer::NoSteer(NoSteerReason::AgreedWithPrior));
+    }
+    Ok(Steer::Move(leader.clone()))
+}
+
+fn ranked(probabilities: &HashMap<String, f64>) -> Vec<(String, f64)> {
+    let mut entries: Vec<(String, f64)> = probabilities
+        .iter()
+        .map(|(label, probability)| (label.clone(), *probability))
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    entries
+}
+
 pub struct JevClient {
     info: InitializeResult,
+    context: PlatformExtensionContext,
 }
 
 impl JevClient {
-    pub fn new(_context: PlatformExtensionContext) -> Result<Self> {
+    pub fn new(context: PlatformExtensionContext) -> Result<Self> {
         let info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new(EXTENSION_NAME.to_string(), "1.0.0".to_string())
@@ -100,21 +186,31 @@ impl JevClient {
                 anything back.
 
                 The answer is advisory. Say where it came from when you relay it.
+
+                steer is different and is the one to prefer for research: you
+                supply the directions you are choosing between and the one you
+                would take on your own judgement, and what comes back is either a
+                direction to consider instead or nothing at all. It never returns
+                a number, so there is nothing in it to mistake for evidence.
             "#}
                 .to_string(),
             );
 
-        Ok(Self { info })
+        Ok(Self { info, context })
     }
 
     fn get_tools() -> Vec<Tool> {
         let schema = schema_for!(AskJevParams);
         let schema_value =
             serde_json::to_value(schema).expect("Failed to serialize AskJevParams schema");
+        let steer_schema = schema_for!(SteerParams);
+        let steer_schema_value =
+            serde_json::to_value(steer_schema).expect("Failed to serialize SteerParams schema");
 
-        vec![Tool::new(
-            ASK_TOOL_NAME.to_string(),
-            indoc! {r#"
+        vec![
+            Tool::new(
+                ASK_TOOL_NAME.to_string(),
+                indoc! {r#"
                 Ask a decision model for a typed answer. It returns a number, not
                 prose: a yes/no probability, one of a set of options, or a level
                 from an ordered rubric.
@@ -145,16 +241,48 @@ impl JevClient {
                 Tell the user what you asked and what came back, including the
                 confidence.
             "#}
-            .to_string(),
-            schema_value.as_object().unwrap().clone(),
-        )
-        .annotate(ToolAnnotations::from_raw(
-            Some("Ask a decision model".to_string()),
-            Some(true),
-            Some(false),
-            Some(true),
-            Some(true),
-        ))]
+                .to_string(),
+                schema_value.as_object().unwrap().clone(),
+            )
+            .annotate(ToolAnnotations::from_raw(
+                Some("Ask a decision model".to_string()),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(true),
+            )),
+            Tool::new(
+                STEER_TOOL_NAME.to_string(),
+                indoc! {r#"
+                Ask which of the directions you proposed to pursue next.
+
+                You supply the question, the candidate directions, and — required —
+                the direction you would take on your own judgement. The ordering is
+                consumed inside goose; what comes back is either a direction to
+                consider instead of your prior, or an explicit no-steer.
+
+                What comes back is deliberately never a number, a probability or a
+                confidence. There is nothing in it to treat as evidence: it is one
+                model's ordering of options you wrote, it cannot explain itself, it
+                is calibrated against nothing in this project, and you may override
+                it. When the ordering cannot move you off your stated prior you are
+                told nothing at all — that is not a confirmation of your prior.
+
+                Do not use this to settle a factual question, and never to decide
+                whether a tool call is safe. Use it when you have several directions
+                you could investigate next and no strong reason to prefer one.
+            "#}
+                .to_string(),
+                steer_schema_value.as_object().unwrap().clone(),
+            )
+            .annotate(ToolAnnotations::from_raw(
+                Some("Steer research".to_string()),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(true),
+            )),
+        ]
     }
 
     fn build_request(params: &AskJevParams) -> Result<(DecisionRequest, String), String> {
@@ -256,6 +384,123 @@ impl JevClient {
 
         Ok(render(&echo, spec.name, &response))
     }
+
+    /// Orders the agent's own candidate directions and returns a move off its
+    /// stated prior, or nothing at all. The numbers stay in here.
+    async fn steer(&self, session_id: &str, params: &SteerParams) -> Result<String, String> {
+        let question = params.question.trim();
+        if question.is_empty() {
+            return Err("the question is empty".to_string());
+        }
+        let prior = params.prior.trim();
+        let labels: Vec<String> = params
+            .candidates
+            .iter()
+            .map(|candidate| candidate.label.trim().to_string())
+            .collect();
+        if labels.len() < 2 {
+            return Err("give at least two candidate directions".to_string());
+        }
+        if labels.iter().any(|label| label.is_empty()) {
+            return Err("candidate labels cannot be empty".to_string());
+        }
+        if labels.iter().collect::<HashSet<_>>().len() != labels.len() {
+            return Err("candidate labels must be distinct".to_string());
+        }
+        if !labels.iter().any(|label| label == prior) {
+            return Err(format!("prior {prior:?} is not one of the candidates"));
+        }
+
+        let spec = decision_provider_from_config(None)
+            .ok_or_else(|| "no decision provider is configured".to_string())?;
+
+        let request = DecisionRequest {
+            model: spec.model.clone(),
+            state: json!({ "background": params.context.clone().unwrap_or_default() }),
+            questions: HashMap::from([(
+                "answer".to_string(),
+                DecisionQuestion::Choice {
+                    instructions: question.to_string(),
+                    criteria: params
+                        .candidates
+                        .iter()
+                        .map(|candidate| {
+                            (
+                                candidate.label.trim().to_string(),
+                                candidate.description.clone(),
+                            )
+                        })
+                        .collect(),
+                },
+            )]),
+        };
+
+        let started = Instant::now();
+        let response = spec
+            .provider
+            .create_decision(&request)
+            .await
+            .map_err(|error| format!("the decision provider failed: {error}"))?;
+        let latency_ms = started.elapsed().as_millis() as i64;
+
+        let Some(DecisionAnswer::Choice {
+            confidence,
+            probabilities,
+            ..
+        }) = response.answers.get("answer")
+        else {
+            return Err("the decision provider did not return a choice".to_string());
+        };
+
+        let ordered = ranked(probabilities);
+        let steer = steer_from(&ordered, *confidence, prior)?;
+
+        let record = JevDecisionRecord {
+            session_id: session_id.to_string(),
+            request_id: format!(
+                "steer-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or(0)
+            ),
+            tool_name: STEER_TOOL_NAME.to_string(),
+            arguments: truncate_json(json!({
+                "question": question,
+                "candidates": labels,
+                "prior": prior,
+                "distribution": probabilities,
+            })),
+            read_only: None,
+            probability: ordered
+                .first()
+                .map(|(_, probability)| *probability)
+                .unwrap_or(0.0),
+            confidence: *confidence,
+            model: response.model.clone(),
+            latency_ms,
+            input_tokens: response.usage.input_tokens.map(|tokens| tokens as i64),
+            cost: response.usage.cost,
+            judge_read_only: None,
+            outcome: match &steer {
+                Steer::Move(_) => "steered".to_string(),
+                Steer::NoSteer(reason) => reason.outcome().to_string(),
+            },
+        };
+        if let Err(error) = self
+            .context
+            .session_manager
+            .record_jev_decision(&record)
+            .await
+        {
+            tracing::warn!("could not record the steer: {error}");
+        }
+
+        Ok(match steer {
+            Steer::Move(chosen) => render_steer(prior, &chosen),
+            Steer::NoSteer(_) => NO_STEER.to_string(),
+        })
+    }
 }
 
 fn render(echo: &str, provider: &str, response: &DecisionResponse) -> String {
@@ -300,6 +545,31 @@ fn render(echo: &str, provider: &str, response: &DecisionResponse) -> String {
     out
 }
 
+const NO_STEER: &str = "No steer: there is no direction to offer. Continue on your own judgement.";
+
+const MAX_LOGGED_ARGUMENTS: usize = 4096;
+
+fn render_steer(prior: &str, chosen: &str) -> String {
+    format!(
+        "You proposed: {prior}\nConsider instead: {chosen}\n\n\
+         This is one decision model's ordering of options you wrote. It cannot explain itself, \
+         it is not evidence, and you may override it.\n\
+         Before acting on it, say what you would expect to see if this direction is wrong."
+    )
+}
+
+fn truncate_json(value: serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.len() <= MAX_LOGGED_ARGUMENTS {
+        return text;
+    }
+    let mut end = MAX_LOGGED_ARGUMENTS;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", text.get(..end).unwrap_or(&text))
+}
+
 fn distribution(probabilities: &HashMap<String, f64>) -> String {
     let mut entries: Vec<_> = probabilities.iter().collect();
     entries.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -338,7 +608,7 @@ impl McpClientTrait for JevClient {
 
     async fn call_tool(
         &self,
-        _ctx: &ToolCallContext,
+        ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
         _cancellation_token: CancellationToken,
@@ -350,6 +620,17 @@ impl McpClientTrait for JevClient {
                         arguments,
                     )) {
                         Ok(params) => self.ask(&params).await,
+                        Err(error) => Err(format!("invalid arguments: {error}")),
+                    }
+                }
+                None => Err("no arguments given".to_string()),
+            },
+            STEER_TOOL_NAME => match arguments {
+                Some(arguments) => {
+                    match serde_json::from_value::<SteerParams>(serde_json::Value::Object(
+                        arguments,
+                    )) {
+                        Ok(params) => self.steer(&ctx.session_id, &params).await,
                         Err(error) => Err(format!("invalid arguments: {error}")),
                     }
                 }
@@ -533,5 +814,132 @@ mod tests {
         );
         assert!(echoed.contains("probability true: 0.770"));
         assert!(echoed.contains("no confidence is available"));
+    }
+
+    fn ordered(pairs: &[(&str, f64)]) -> Vec<(String, f64)> {
+        pairs
+            .iter()
+            .map(|(label, probability)| (label.to_string(), *probability))
+            .collect()
+    }
+
+    #[test]
+    fn a_clear_leader_that_is_not_the_prior_becomes_a_move() {
+        let ranked = ordered(&[("analyse-logs", 0.80), ("rewrite-parser", 0.12)]);
+        assert_eq!(
+            steer_from(&ranked, 0.90, "rewrite-parser").unwrap(),
+            Steer::Move("analyse-logs".to_string())
+        );
+    }
+
+    #[test]
+    fn a_clear_leader_that_is_the_prior_is_not_a_steer() {
+        let ranked = ordered(&[("analyse-logs", 0.80), ("rewrite-parser", 0.12)]);
+        assert_eq!(
+            steer_from(&ranked, 0.90, "analyse-logs").unwrap(),
+            Steer::NoSteer(NoSteerReason::AgreedWithPrior)
+        );
+    }
+
+    #[test]
+    fn a_narrow_margin_is_not_a_steer() {
+        let ranked = ordered(&[("analyse-logs", 0.42), ("rewrite-parser", 0.38)]);
+        assert_eq!(
+            steer_from(&ranked, 0.95, "rewrite-parser").unwrap(),
+            Steer::NoSteer(NoSteerReason::NotDistinguishable)
+        );
+    }
+
+    #[test]
+    fn low_confidence_is_not_a_steer_however_wide_the_margin() {
+        let ranked = ordered(&[("analyse-logs", 0.95), ("rewrite-parser", 0.02)]);
+        assert_eq!(
+            steer_from(&ranked, 0.30, "rewrite-parser").unwrap(),
+            Steer::NoSteer(NoSteerReason::NotDistinguishable)
+        );
+    }
+
+    #[test]
+    fn the_confidence_bound_is_inclusive() {
+        let ranked = ordered(&[("a", 0.75), ("b", 0.10)]);
+        assert_eq!(
+            steer_from(&ranked, MIN_USEFUL_CONFIDENCE, "b").unwrap(),
+            Steer::Move("a".to_string())
+        );
+        assert_eq!(
+            steer_from(&ranked, MIN_USEFUL_CONFIDENCE - 0.01, "b").unwrap(),
+            Steer::NoSteer(NoSteerReason::NotDistinguishable)
+        );
+    }
+
+    #[test]
+    fn a_margin_that_only_looks_like_the_boundary_is_not_one() {
+        // 0.60 - 0.40 is 0.19999999999999996, so a pair that "is" exactly the
+        // margin falls just under it. The margin is a policy knob, not an exact
+        // threshold, so this is the right outcome — but it is worth knowing.
+        let ranked = ordered(&[("a", 0.60), ("b", 0.40)]);
+        assert!(ranked[0].1 - ranked[1].1 < MIN_STEER_MARGIN);
+        assert_eq!(
+            steer_from(&ranked, 0.95, "b").unwrap(),
+            Steer::NoSteer(NoSteerReason::NotDistinguishable)
+        );
+    }
+
+    #[test]
+    fn an_empty_distribution_is_an_error() {
+        assert!(steer_from(&[], 0.9, "a").is_err());
+    }
+
+    #[test]
+    fn a_steer_carries_no_number() {
+        let text = render_steer("rewrite-parser", "analyse-logs");
+        assert!(text.contains("rewrite-parser"));
+        assert!(text.contains("analyse-logs"));
+        assert!(
+            !text.chars().any(|character| character.is_ascii_digit()),
+            "a steer must not carry a number: {text}"
+        );
+        assert!(text.contains("not evidence"));
+        assert!(text.contains("what you would expect to see"));
+    }
+
+    #[test]
+    fn the_no_steer_reply_does_not_confirm_the_prior() {
+        assert!(!NO_STEER.contains("confirm"));
+        assert!(NO_STEER.contains("Continue on your own judgement"));
+    }
+
+    #[test]
+    fn the_steer_tool_description_carries_the_caveats() {
+        let description = JevClient::get_tools()[1]
+            .description
+            .as_ref()
+            .expect("the tool has a description")
+            .to_string();
+        for caveat in [
+            "never a number",
+            "nothing in it to treat as evidence",
+            "cannot explain itself",
+            "may override",
+            "not a confirmation",
+            "never to decide",
+        ] {
+            assert!(
+                description.contains(caveat),
+                "the steer description should mention {caveat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_distribution_is_ordered_by_probability() {
+        let ranked = ranked(&HashMap::from([
+            ("low".to_string(), 0.1),
+            ("high".to_string(), 0.7),
+            ("mid".to_string(), 0.2),
+        ]));
+        assert_eq!(ranked[0].0, "high");
+        assert_eq!(ranked[1].0, "mid");
+        assert_eq!(ranked[2].0, "low");
     }
 }

@@ -230,7 +230,7 @@ pub async fn run_shadow(
             request_id: verdict.request_id,
             tool_name: verdict.tool_name,
             arguments: verdict.arguments,
-            read_only: verdict.read_only,
+            read_only: Some(verdict.read_only),
             probability: verdict.probability,
             confidence: verdict.confidence,
             model: spec.model.clone(),
@@ -450,10 +450,10 @@ mod tests {
         eprintln!("{stored:#?}");
         assert_eq!(stored.len(), 2);
         assert!(stored.iter().any(|row| row.request_id == "r1"
-            && row.read_only
+            && row.read_only == Some(true)
             && row.outcome == "agreed_read_only"));
         assert!(stored.iter().any(|row| row.request_id == "r2"
-            && !row.read_only
+            && row.read_only == Some(false)
             && row.judge_read_only == Some(false)));
         assert!(stored.iter().all(|row| row.model == "typesafe/jev-1.13"));
     }
