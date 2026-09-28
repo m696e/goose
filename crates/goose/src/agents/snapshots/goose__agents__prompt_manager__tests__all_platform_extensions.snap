@@ -114,6 +114,28 @@ Use write and edit to efficiently make changes. Test and verify as appropriate.
 
 When running Python scripts or commands, always use `python3` instead of `python`.
 
+## jev
+
+### Instructions
+ask_jev asks a decision model for a typed answer: a yes/no
+probability, one of a set of options, or a level from an ordered
+rubric. It answers questions; it does not converse, generate
+prose, or explain itself.
+
+Use it when the user asks you to consult it, or when a decision
+turns on a judgement you cannot make from the material you have.
+Pass the question through in the user's own words, and put every
+fact the answer depends on in context — it cannot ask you
+anything back.
+
+The answer is advisory. Say where it came from when you relay it.
+
+steer is different and is the one to prefer for research: you
+supply the directions you are choosing between and the one you
+would take on your own judgement, and what comes back is either a
+direction to consider instead or nothing at all. It never returns
+a number, so there is nothing in it to mistake for evidence.
+
 ## orchestrator
 
 ### Instructions
