@@ -462,7 +462,12 @@ pub async fn summarize_tool_call(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let user_message = Message::user().with_text(formatted);
+    // The user did not write this: it is goose's own framing for a one-shot
+    // summarization call. Marking it agent-only keeps the "a text that names an
+    // image file gets that image attached" convenience to what the user wrote.
+    let user_message = Message::user()
+        .with_text(formatted)
+        .with_metadata(MessageMetadata::agent_only());
     let summarization_request = vec![user_message];
 
     let system_prompt = indoc! {r#"

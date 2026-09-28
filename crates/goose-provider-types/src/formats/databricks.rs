@@ -37,10 +37,10 @@ struct DatabricksMessage {
 fn format_text_content(
     text: &str,
     image_format: &ImageFormat,
-    supports_vision: bool,
+    attach_referenced_images: bool,
 ) -> (Vec<Value>, bool) {
     let mut items = vec![json!({"type": "text", "text": text})];
-    let has_image = if supports_vision {
+    let has_image = if attach_referenced_images {
         if let Some(path) = detect_image_path(text) {
             if let Ok(image) = load_image_file(path.as_ref()) {
                 items.push(convert_image(&image, image_format));
@@ -148,12 +148,19 @@ fn format_messages(
         // Deferred so all tool-role messages stay consecutive (required by Claude via Databricks).
         let mut pending_image_messages: Vec<DatabricksMessage> = Vec::new();
 
+        // Only a user's own text may name an image file to attach. Goose writes
+        // user-role messages of its own (a compaction summary, an advisory),
+        // which can quote a path without asking for the file; attaching it
+        // would put an image back into a context compaction just replaced.
+        let attach_referenced_images =
+            supports_vision && message.role == Role::User && message.metadata.user_visible;
+
         for content in &message.content {
             match content {
                 MessageContentBlock::Text(text) => {
                     if !text.text.is_empty() {
                         let (items, multi) =
-                            format_text_content(&text.text, image_format, supports_vision);
+                            format_text_content(&text.text, image_format, attach_referenced_images);
                         content_array.extend(items);
                         has_multiple_content |= multi;
                     }

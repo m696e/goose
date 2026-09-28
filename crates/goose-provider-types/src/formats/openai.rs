@@ -18,7 +18,9 @@ use async_stream::try_stream;
 use chrono;
 use futures::Stream;
 use regex::Regex;
-use rmcp::model::{object, CallToolRequestParams, ContentBlock, ErrorCode, ErrorData, Role, Tool};
+use rmcp::model::{
+    object, CallToolRequestParams, ContentBlock, ErrorCode, ErrorData, ImageContent, Role, Tool,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -198,6 +200,26 @@ fn extract_content_and_signature(
     }
 }
 
+/// A user's text can name a local image file, which is attached so the model
+/// sees it without a tool call. Only text the user wrote counts. Goose writes
+/// user-role messages of its own — compaction summaries, advisories, and the
+/// copies it carries across a compaction — and those can quote the same path
+/// without asking for the file: attaching it would put an image back into a
+/// context that compaction had just replaced, at whatever size the file
+/// happens to be, which can exceed the provider's request limit on its own.
+fn user_referenced_image(
+    text: &str,
+    message: &Message,
+    options: &OpenAiFormatOptions,
+) -> Option<ImageContent> {
+    if message.role != Role::User || !message.metadata.user_visible || !options.supports_vision {
+        return None;
+    }
+
+    let path = detect_image_path(text)?;
+    load_image_file(path.as_ref()).ok()
+}
+
 pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Value> {
     format_messages_with_options(
         messages,
@@ -276,26 +298,11 @@ pub fn format_messages_with_options(
             match content {
                 MessageContentBlock::Text(text) => {
                     if !text.text.is_empty() {
-                        if message.role == Role::User {
-                            if options.supports_vision {
-                                if let Some(image_path) = detect_image_path(&text.text) {
-                                    if let Ok(image) = load_image_file(image_path.as_ref()) {
-                                        has_non_text_content = true;
-                                        content_array
-                                            .push(json!({"type": "text", "text": text.text}));
-                                        content_array.push(convert_image(&image, image_format));
-                                    } else {
-                                        content_array
-                                            .push(json!({"type": "text", "text": text.text}));
-                                    }
-                                } else {
-                                    content_array.push(json!({"type": "text", "text": text.text}));
-                                }
-                            } else {
-                                content_array.push(json!({"type": "text", "text": text.text}));
-                            }
-                        } else {
-                            content_array.push(json!({"type": "text", "text": text.text}));
+                        let referenced = user_referenced_image(&text.text, message, &options);
+                        content_array.push(json!({"type": "text", "text": text.text}));
+                        if let Some(image) = referenced {
+                            has_non_text_content = true;
+                            content_array.push(convert_image(&image, image_format));
                         }
                     }
                 }
@@ -2570,6 +2577,60 @@ mod tests {
             "Assistant message content should be a string, not an array with image"
         );
         assert!(content.unwrap().contains(png_path_str));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_goose_authored_text_does_not_attach_a_referenced_image() -> anyhow::Result<()> {
+        // A compaction summary is a user-role message goose writes, and it can
+        // quote an image path it read earlier without asking for that file.
+        // Attaching it would put an image back into the context compaction just
+        // replaced, at whatever size the file happens to be on disk.
+        let temp_dir = tempfile::tempdir()?;
+        let png_path = temp_dir.path().join("panel.png");
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, // PNG magic number
+            0x0D, 0x0A, 0x1A, 0x0A, // PNG header
+            0x00, 0x00, 0x00, 0x0D, // Rest of fake PNG data
+        ];
+        std::fs::write(&png_path, png_data)?;
+        let png_path_str = png_path.to_str().unwrap();
+        let text = format!("# Conversation Summary\n\n### {png_path_str}\nPhoto evidence.");
+        let options = OpenAiFormatOptions {
+            preserve_thinking_context: true,
+            supports_vision: true,
+            ..Default::default()
+        };
+
+        // Goose-authored: agent-only, the way compact_messages stores it.
+        let summary = Message::user()
+            .with_text(text.clone())
+            .with_visibility(false, true);
+        let spec = format_messages_with_options(
+            std::slice::from_ref(&summary),
+            &ImageFormat::OpenAi,
+            options,
+        );
+        let content = spec[0]["content"]
+            .as_str()
+            .expect("nothing is attached, so the text stays a plain string");
+        assert!(content.contains(png_path_str));
+
+        // The same text the user wrote still attaches the file.
+        let written = Message::user().with_text(text.clone());
+        let spec = format_messages_with_options(
+            std::slice::from_ref(&written),
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+        let content = spec[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image_url");
 
         Ok(())
     }
