@@ -8,6 +8,7 @@ pub mod chatrecall;
 pub mod code_execution;
 pub mod developer;
 pub mod ext_manager;
+pub mod jev;
 pub mod orchestrator;
 #[cfg(feature = "scheduler")]
 pub mod scheduler;
@@ -217,6 +218,19 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 unprefixed_tools: false,
                 hidden: true,
                 client_factory: |ctx| Some(Box::new(orchestrator::OrchestratorClient::new(ctx).unwrap())),
+            },
+        );
+
+        map.insert(
+            jev::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: jev::EXTENSION_NAME,
+                display_name: "Jev Decisions",
+                description: "Ask a decision model for a typed answer: a probability, a choice, or a rubric level",
+                default_enabled: false,
+                unprefixed_tools: false,
+                hidden: false,
+                client_factory: |ctx| Some(Box::new(jev::JevClient::new(ctx).unwrap())),
             },
         );
 
