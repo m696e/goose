@@ -2983,6 +2983,14 @@ impl SessionStorage {
             .execute(&mut *tx)
             .await?;
 
+        // compaction_events carries a NO ACTION foreign key to sessions, so a
+        // session that has ever been compacted cannot be deleted until its
+        // events are gone. Without this every compacted session is undeletable.
+        sqlx::query("DELETE FROM compaction_events WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
             .execute(&mut *tx)
@@ -5882,6 +5890,35 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_removes_its_compaction_events() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+
+        sm.record_archive_event(
+            &id,
+            &CompactionEvent::new(
+                CompactionTrigger::Model,
+                Some("test".to_string()),
+                &Conversation::empty(),
+                &Conversation::empty(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.list_compaction_events(&id).await.unwrap().len(), 1);
+
+        // compaction_events has a NO ACTION foreign key to sessions, so this
+        // failed before the events were deleted with the session.
+        sm.delete_session(&id).await.unwrap();
+
+        assert!(sm.get_session(&id, false).await.is_err());
+        assert!(sm.list_compaction_events(&id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
