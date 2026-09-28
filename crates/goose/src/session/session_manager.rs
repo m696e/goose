@@ -8,6 +8,7 @@ use crate::recipe::Recipe;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
 use crate::session::export_markdown::export_session_to_markdown;
 use crate::session::extension_data::ExtensionData;
+use crate::session::jev_decision::{JevDecisionRecord, StoredJevDecision};
 use crate::session::session_naming::{
     generate_session_name, MSG_COUNT_FOR_SESSION_NAME_GENERATION,
 };
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+pub const CURRENT_SCHEMA_VERSION: i32 = 21;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -668,6 +669,16 @@ impl SessionManager {
 
     pub async fn list_compaction_events(&self, id: &str) -> Result<Vec<StoredCompactionEvent>> {
         self.storage.list_compaction_events(id).await
+    }
+
+    /// Record what a decision provider answered for each tool request. The
+    /// shadow classifier writes here; permissions never read it back.
+    pub async fn record_jev_decision(&self, decision: &JevDecisionRecord) -> Result<()> {
+        self.storage.insert_jev_decision(decision).await
+    }
+
+    pub async fn list_jev_decisions(&self, id: &str) -> Result<Vec<StoredJevDecision>> {
+        self.storage.list_jev_decisions(id).await
     }
 
     /// Record that messages were taken away from the agent without replacing the
@@ -1325,6 +1336,7 @@ impl SessionStorage {
         .execute(&mut *tx)
         .await?;
         Self::create_compaction_events_table(&mut tx).await?;
+        Self::create_jev_decisions_table(&mut tx).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)")
             .execute(&mut *tx)
             .await?;
@@ -1850,6 +1862,9 @@ impl SessionStorage {
                 .execute(&mut **tx)
                 .await?;
             }
+            21 => {
+                Self::create_jev_decisions_table(tx).await?;
+            }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
             }
@@ -2227,6 +2242,100 @@ impl SessionStorage {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    async fn create_jev_decisions_table(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS jev_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                request_id TEXT NOT NULL,
+                tool_name TEXT,
+                arguments_json TEXT,
+                read_only INTEGER,
+                probability REAL,
+                confidence REAL,
+                model TEXT,
+                latency_ms INTEGER,
+                input_tokens INTEGER,
+                cost REAL,
+                judge_read_only INTEGER,
+                outcome TEXT
+            )",
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_jev_decisions_session ON jev_decisions(session_id)",
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_jev_decision(&self, decision: &JevDecisionRecord) -> Result<()> {
+        let pool = self.pool().await?;
+        sqlx::query(
+            "INSERT INTO jev_decisions (session_id, request_id, tool_name, arguments_json, read_only, probability, confidence, model, latency_ms, input_tokens, cost, judge_read_only, outcome) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&decision.session_id)
+        .bind(&decision.request_id)
+        .bind(&decision.tool_name)
+        .bind(&decision.arguments)
+        .bind(decision.read_only as i64)
+        .bind(decision.probability)
+        .bind(decision.confidence)
+        .bind(&decision.model)
+        .bind(decision.latency_ms)
+        .bind(decision.input_tokens)
+        .bind(decision.cost)
+        .bind(decision.judge_read_only.map(|value| value as i64))
+        .bind(&decision.outcome)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_jev_decisions(&self, session_id: &str) -> Result<Vec<StoredJevDecision>> {
+        let pool = self.pool().await?;
+        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<i64>, f64, f64, Option<String>, Option<i64>, Option<String>)>(
+            "SELECT id, strftime('%Y-%m-%d %H:%M:%S', created_at), request_id, tool_name, read_only, probability, confidence, model, judge_read_only, outcome \
+             FROM jev_decisions WHERE session_id = ? ORDER BY id",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    created_at,
+                    request_id,
+                    tool_name,
+                    read_only,
+                    probability,
+                    confidence,
+                    model,
+                    judge_read_only,
+                    outcome,
+                )| StoredJevDecision {
+                    id,
+                    created_at,
+                    request_id,
+                    tool_name: tool_name.unwrap_or_default(),
+                    read_only: read_only.unwrap_or(0) != 0,
+                    probability,
+                    confidence,
+                    model: model.unwrap_or_default(),
+                    judge_read_only: judge_read_only.map(|value| value != 0),
+                    outcome: outcome.unwrap_or_default(),
+                },
+            )
+            .collect())
     }
 
     /// The create statement already includes `carry`, so a database that gets
@@ -5466,6 +5575,59 @@ mod tests {
         assert_eq!(loaded.accumulated_usage, accumulated_usage);
     }
 
+    #[tokio::test]
+    async fn a_v20_database_gains_the_jev_decisions_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join(SESSIONS_FOLDER).join(DB_NAME);
+
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+
+        SessionStorage::create_schema(&pool).await.unwrap();
+        // Recreate a v20-shaped database, before jev_decisions existed.
+        sqlx::query("DROP TABLE IF EXISTS jev_decisions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 20")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        sm.storage().pool().await.unwrap(); // Triggers migration
+
+        let id = new_session(&sm).await;
+        sm.record_jev_decision(&JevDecisionRecord {
+            session_id: id.clone(),
+            request_id: "r1".to_string(),
+            tool_name: "developer__shell".to_string(),
+            arguments: "{}".to_string(),
+            read_only: true,
+            probability: 0.9,
+            confidence: 0.9,
+            model: "typesafe/jev-1.13".to_string(),
+            latency_ms: 1,
+            input_tokens: None,
+            cost: None,
+            judge_read_only: None,
+            outcome: "agreed_read_only".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sm.list_jev_decisions(&id).await.unwrap().len(), 1);
+    }
+
     fn message_usage(input: i32, output: i32, cost: f64, is_compaction: bool) -> MessageUsage {
         MessageUsage {
             input_tokens: Some(input),
@@ -5488,6 +5650,58 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    #[tokio::test]
+    async fn jev_decisions_round_trip_and_default_to_needs_approval() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+
+        sm.record_jev_decision(&JevDecisionRecord {
+            session_id: id.clone(),
+            request_id: "r1".to_string(),
+            tool_name: "developer__shell".to_string(),
+            arguments: "{\"command\":\"ls\"}".to_string(),
+            read_only: true,
+            probability: 0.93,
+            confidence: 0.88,
+            model: "typesafe/jev-1.13".to_string(),
+            latency_ms: 812,
+            input_tokens: Some(420),
+            cost: Some(0.00001764),
+            judge_read_only: Some(true),
+            outcome: "agreed_read_only".to_string(),
+        })
+        .await
+        .unwrap();
+
+        sm.record_jev_decision(&JevDecisionRecord {
+            session_id: id.clone(),
+            request_id: "r2".to_string(),
+            tool_name: "developer__write".to_string(),
+            arguments: "{}".to_string(),
+            read_only: false,
+            probability: 0.02,
+            confidence: 0.99,
+            model: "typesafe/jev-1.13".to_string(),
+            latency_ms: 812,
+            input_tokens: Some(420),
+            cost: Some(0.00001764),
+            judge_read_only: Some(false),
+            outcome: "agreed_needs_approval".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let stored = sm.list_jev_decisions(&id).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].request_id, "r1");
+        assert!(stored[0].read_only);
+        assert_eq!(stored[0].judge_read_only, Some(true));
+        assert_eq!(stored[0].outcome, "agreed_read_only");
+        assert!(!stored[1].read_only);
+        assert_eq!(stored[1].model, "typesafe/jev-1.13");
     }
 
     async fn seed_ledger(

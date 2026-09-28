@@ -263,6 +263,16 @@ impl ToolInspector for PermissionInspector {
                     finding_id: None,
                 });
             }
+
+            if crate::permission::jev_shadow::shadow_enabled() {
+                crate::permission::jev_shadow::run_shadow(
+                    &self.session_manager,
+                    session_id,
+                    llm_detect_candidates.to_vec(),
+                    &detected_request_ids,
+                )
+                .await;
+            }
         }
 
         Ok(results)

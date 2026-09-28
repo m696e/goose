@@ -34,6 +34,7 @@ pub mod cursor_agent;
 pub mod custom_provider_config;
 pub mod databricks_def;
 pub mod databricks_v2_def;
+pub mod decision_provider;
 pub mod formats;
 mod gcpauth;
 pub mod gcpvertexai;

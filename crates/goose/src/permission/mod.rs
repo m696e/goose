@@ -1,3 +1,4 @@
+pub mod jev_shadow;
 pub mod permission_inspector;
 pub mod permission_judge;
 pub mod permission_store;

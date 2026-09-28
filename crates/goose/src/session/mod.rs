@@ -4,6 +4,7 @@ mod diagnostics;
 mod export_markdown;
 pub mod extension_data;
 pub mod import_formats;
+pub mod jev_decision;
 mod last_message_snippet;
 mod legacy;
 #[cfg(feature = "nostr")]
@@ -22,6 +23,7 @@ pub use export_markdown::{
     export_session_to_markdown, message_to_markdown, user_projected_message_to_markdown,
 };
 pub use extension_data::{EnabledExtensionsState, ExtensionData, ExtensionState, TodoState};
+pub use jev_decision::{JevDecisionRecord, StoredJevDecision};
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
     StoredCompactionEvent,
