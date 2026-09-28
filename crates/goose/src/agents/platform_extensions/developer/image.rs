@@ -23,6 +23,14 @@ const MAX_ENCODED_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// to about this size themselves, so the model loses nothing it would have seen.
 const DOWNSCALE_LONGEST_EDGE: u32 = 1568;
 
+/// Longest side an attached image may have, held to the smallest per-side cap
+/// among the vision providers rather than to any one of them: Anthropic
+/// documents 8000 px, and the gateway in front of this workstation's provider
+/// answers 200 at 8192 and 400 at 8193 on either side. The refusal is per side
+/// and not per area — 1000x8000 is accepted while 820x9000 is refused — so the
+/// longest edge is what is checked.
+const MAX_IMAGE_EDGE: u32 = 8000;
+
 /// Quality of the re-encoding, high enough that the model cannot tell the
 /// difference at the sizes involved.
 const JPEG_QUALITY: u8 = 85;
@@ -230,14 +238,14 @@ impl std::fmt::Debug for EncodedImage {
 
 /// An image whose encoded form would make the request too large is reduced
 /// until it fits, so the model can act on it instead of the request being
-/// refused. When even that is not enough, the error says what to do about it —
-/// the model can crop, downscale, or read something else.
+/// refused. When even that is not enough, the error reports the sizes involved
+/// and that nothing was attached, leaving the remedy to the model.
 fn shrink_to_budget(
     source: &image::DynamicImage,
     encoded: EncodedImage,
 ) -> Result<EncodedImage, String> {
     if encoded.bytes.len() <= MAX_ENCODED_IMAGE_BYTES {
-        return Ok(encoded);
+        return within_max_edge(encoded);
     }
 
     let (mut width, mut height) = (source.width(), source.height());
@@ -267,14 +275,27 @@ fn shrink_to_budget(
     }
 
     Err(format!(
-        "image is too large to send: {} when encoded, and the provider's request limit needs it \
-         under {}. Reading it at {}x{} is not enough. Crop to a smaller region with the `crop` \
-         parameter, or downscale the file first (for example \
-         `magick input.jpg -resize 1200x1200 smaller.jpg`) and read that.",
+        "image is {} when encoded and the provider's request limit allows {}, and no reduced \
+         size tried came under that, so no image was attached. The file is unchanged.",
         human_size(encoded.bytes.len()),
         human_size(MAX_ENCODED_IMAGE_BYTES),
-        DOWNSCALE_LONGEST_EDGE,
-        DOWNSCALE_LONGEST_EDGE,
+    ))
+}
+
+/// An image within the encoded byte budget can still be one the provider
+/// refuses for its shape, so the dimensions are reported instead of being
+/// corrected: which detail to keep is a choice the model makes with a crop, and
+/// a downscale here would make that choice for it.
+fn within_max_edge(encoded: EncodedImage) -> Result<EncodedImage, String> {
+    let longest = encoded.width.max(encoded.height);
+    if longest <= MAX_IMAGE_EDGE {
+        return Ok(encoded);
+    }
+
+    Err(format!(
+        "image is {}x{}; the provider accepts a side of at most {} px, so no image was attached. \
+         The file is unchanged.",
+        encoded.width, encoded.height, MAX_IMAGE_EDGE,
     ))
 }
 
@@ -765,7 +786,7 @@ mod shrink_tests {
     }
 
     #[test]
-    fn tells_the_model_what_to_do_when_reducing_is_not_enough() {
+    fn reports_the_sizes_when_reducing_is_not_enough() {
         // A 1x1 image keeps every attempt above a budget that nothing can meet.
         let image = noisy(1, 1);
         let original = EncodedImage {
@@ -779,9 +800,37 @@ mod shrink_tests {
 
         let error = shrink_to_budget(&image, original).expect_err("cannot fit");
 
-        assert!(error.contains("crop"), "{error}");
-        assert!(error.contains("downscale"), "{error}");
+        assert!(error.contains("4.0 MiB"), "{error}");
         assert!(error.contains("MiB"), "{error}");
+        assert!(error.contains("no image was attached"), "{error}");
+        assert!(error.contains("unchanged"), "{error}");
+    }
+
+    #[test]
+    fn reports_an_image_the_provider_refuses_for_its_shape() {
+        // 9000x1 encodes to a few bytes: well inside the byte budget, and a side
+        // the provider answers 400 to. It is reported rather than reduced, since
+        // a reduction would pick which detail to keep on the model's behalf.
+        let image = noisy(9000, 1);
+        let original = encoded(&image);
+        assert!(original.bytes.len() <= MAX_ENCODED_IMAGE_BYTES);
+
+        let error = shrink_to_budget(&image, original).expect_err("provider would refuse it");
+
+        assert!(error.contains("9000x1"), "{error}");
+        assert!(error.contains("8000"), "{error}");
+        assert!(error.contains("no image was attached"), "{error}");
+        assert!(error.contains("unchanged"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_side_exactly_at_the_limit() {
+        let image = noisy(1, MAX_IMAGE_EDGE);
+        let original = encoded(&image);
+
+        let fitted = shrink_to_budget(&image, original).expect("at the limit");
+
+        assert!(!fitted.downscaled);
     }
 
     #[test]
