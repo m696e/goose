@@ -45,7 +45,8 @@ fn apply_canonical_limits(provider_name: &str, model: ModelConfig) -> ModelConfi
     if provider_name == goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
         return model;
     }
-    with_declarative_vision(provider_name, model.with_canonical_limits(provider_name))
+    let model = with_declarative_vision(provider_name, model.with_canonical_limits(provider_name));
+    with_declarative_image_dimension(provider_name, model)
 }
 
 /// Declarative and custom providers may serve models the canonical registry
@@ -69,6 +70,43 @@ fn declared_supports_vision(provider_name: &str, model_name: &str) -> Option<boo
         .iter()
         .find(|model| model.name == model_name)?
         .supports_vision
+}
+
+/// Re-derive the longest image side the endpoint accepts from the provider's
+/// current declaration, discarding any value stored on the model config. The
+/// limit is configuration state, not session state: a resumed session must
+/// reflect what the provider declares now, including a declaration it did not
+/// have when the session was saved.
+pub fn with_rederived_image_dimension(provider_name: &str, mut model: ModelConfig) -> ModelConfig {
+    model.max_image_dimension = None;
+    with_declarative_image_dimension(provider_name, model)
+}
+
+/// The longest image side the endpoint accepts, as the provider declares it.
+/// A model entry that states a value wins over the provider's own, since the
+/// limit belongs to the endpoint serving that model. Unstated stays `None`:
+/// the numbers differ between endpoints, and a guess would either refuse an
+/// image the provider takes or claim a limit goose has not been told.
+fn with_declarative_image_dimension(provider_name: &str, mut model: ModelConfig) -> ModelConfig {
+    if model.max_image_dimension.is_none() {
+        if let Some(dimension) = declared_max_image_dimension(provider_name, &model.model_name) {
+            model = model.with_max_image_dimension(dimension);
+        }
+    }
+    model
+}
+
+fn declared_max_image_dimension(provider_name: &str, model_name: &str) -> Option<u32> {
+    let provider = crate::config::declarative_providers::load_provider(provider_name)
+        .ok()?
+        .config;
+
+    provider
+        .models
+        .iter()
+        .find(|model| model.name == model_name)
+        .and_then(|model| model.max_image_dimension)
+        .or(provider.max_image_dimension)
 }
 
 fn materialize_model_config_inner(
@@ -193,6 +231,7 @@ fn base_model_config_from_user_config(
         request_params: None,
         reasoning: None,
         supports_vision: None,
+        max_image_dimension: None,
         request_headers: None,
     };
     if provider_name != goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
@@ -345,6 +384,101 @@ mod declarative_vision_tests {
 
         let config = model_config_from_user_config(&provider, "unknown-text-model").unwrap();
         assert_eq!(config.supports_vision, Some(false));
+    }
+
+    fn declare_provider_image_dimension(provider: &str, dimension: u32) {
+        let path =
+            crate::config::declarative_providers::custom_provider_file_path(provider).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["max_image_dimension"] = serde_json::json!(dimension);
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fills_the_image_dimension_a_model_declares() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(
+            ModelInfo::new("limited-vision-model")
+                .with_vision_support(true)
+                .with_max_image_dimension(4096),
+        );
+
+        let config = model_config_from_user_config(&provider, "limited-vision-model").unwrap();
+        assert_eq!(config.max_image_dimension, Some(4096));
+    }
+
+    #[test]
+    fn fills_the_image_dimension_a_provider_declares() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(ModelInfo::new("unlimited-vision-model"));
+        declare_provider_image_dimension(&provider, 8192);
+
+        let config = model_config_from_user_config(&provider, "unlimited-vision-model").unwrap();
+        assert_eq!(config.max_image_dimension, Some(8192));
+    }
+
+    #[test]
+    fn a_model_image_dimension_wins_over_the_providers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(
+            ModelInfo::new("narrow-vision-model").with_max_image_dimension(4096),
+        );
+        declare_provider_image_dimension(&provider, 8192);
+
+        let config = model_config_from_user_config(&provider, "narrow-vision-model").unwrap();
+        assert_eq!(config.max_image_dimension, Some(4096));
+    }
+
+    #[test]
+    fn undeclared_image_dimension_stays_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(ModelInfo::new("silent-vision-model"));
+
+        let config = model_config_from_user_config(&provider, "silent-vision-model").unwrap();
+        assert_eq!(config.max_image_dimension, None);
+    }
+
+    #[test]
+    fn rederivation_replaces_a_stored_dimension_with_the_declared_one() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(
+            ModelInfo::new("restated-vision-model").with_max_image_dimension(4096),
+        );
+        let stored = ModelConfig::new("restated-vision-model").with_max_image_dimension(9999);
+
+        let rederived = with_rederived_image_dimension(&provider, stored);
+
+        assert_eq!(rederived.max_image_dimension, Some(4096));
+    }
+
+    #[test]
+    fn rederivation_drops_a_stored_dimension_no_longer_declared() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_root.as_str()))]);
+
+        let provider = create_provider_with_model(ModelInfo::new("undefined-vision-model"));
+        let stored = ModelConfig::new("undefined-vision-model").with_max_image_dimension(4096);
+
+        let rederived = with_rederived_image_dimension(&provider, stored);
+
+        assert_eq!(rederived.max_image_dimension, None);
     }
 
     #[test]

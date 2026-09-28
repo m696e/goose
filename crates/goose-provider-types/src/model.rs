@@ -53,6 +53,12 @@ pub struct ModelConfig {
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// The longest side, in pixels, this provider or model accepts in an
+    /// attached image. `None` means the limit is not declared, and callers must
+    /// not guess one: the refusal is a property of the endpoint, and the
+    /// numbers in use differ (Anthropic documents 8000 px).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_dimension: Option<u32>,
     /// Per-request HTTP headers attached to outgoing provider calls.
     /// Never serialized into request bodies.
     #[serde(skip)]
@@ -79,6 +85,8 @@ impl<'de> Deserialize<'de> for ModelConfig {
             reasoning: Option<bool>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             supports_vision: Option<bool>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            max_image_dimension: Option<u32>,
         }
 
         let raw = RawModelConfig::deserialize(deserializer)?;
@@ -92,6 +100,7 @@ impl<'de> Deserialize<'de> for ModelConfig {
             request_params: raw.request_params,
             reasoning: raw.reasoning,
             supports_vision: raw.supports_vision,
+            max_image_dimension: raw.max_image_dimension,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -111,6 +120,7 @@ impl ModelConfig {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -240,6 +250,11 @@ impl ModelConfig {
 
     pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
         self.supports_vision = Some(supports_vision);
+        self
+    }
+
+    pub fn with_max_image_dimension(mut self, max_image_dimension: u32) -> Self {
+        self.max_image_dimension = Some(max_image_dimension);
         self
     }
 

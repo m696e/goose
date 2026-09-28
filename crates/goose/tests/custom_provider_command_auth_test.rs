@@ -29,6 +29,7 @@ fn custom_config_with_auth(base_url: &str, auth: AuthConfig) -> DeclarativeProvi
         stream_chunk_timeout_secs: None,
         stream_first_line_timeout_secs: None,
         max_request_bytes: None,
+        max_image_dimension: None,
         supports_streaming: Some(true),
         requires_auth: true,
         catalog_provider_id: None,

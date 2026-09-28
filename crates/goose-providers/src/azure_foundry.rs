@@ -414,6 +414,7 @@ fn model_info_for_deployment(deployment_name: &str, model_name: &str) -> ModelIn
         currency: None,
         supports_cache_control: None,
         supports_vision: None,
+        max_image_dimension: None,
         reasoning: canonical
             .and_then(|model| model.reasoning)
             .unwrap_or_else(|| ModelConfig::new(model_name).is_reasoning_model()),

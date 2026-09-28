@@ -1346,6 +1346,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1382,6 +1383,7 @@ mod tests {
             request_params: Some(params),
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1403,6 +1405,7 @@ mod tests {
             request_params: Some(params),
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1425,6 +1428,7 @@ mod tests {
             request_params: Some(params),
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1445,6 +1449,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1465,6 +1470,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1485,6 +1491,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
@@ -1873,6 +1880,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -1927,6 +1935,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 

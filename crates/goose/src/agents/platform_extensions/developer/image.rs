@@ -23,17 +23,23 @@ const MAX_ENCODED_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// to about this size themselves, so the model loses nothing it would have seen.
 const DOWNSCALE_LONGEST_EDGE: u32 = 1568;
 
-/// Longest side an attached image may have, held to the smallest per-side cap
-/// among the vision providers rather than to any one of them: Anthropic
-/// documents 8000 px, and the gateway in front of this workstation's provider
-/// answers 200 at 8192 and 400 at 8193 on either side. The refusal is per side
-/// and not per area — 1000x8000 is accepted while 820x9000 is refused — so the
-/// longest edge is what is checked.
-const MAX_IMAGE_EDGE: u32 = 8000;
-
 /// Quality of the re-encoding, high enough that the model cannot tell the
 /// difference at the sizes involved.
 const JPEG_QUALITY: u8 = 85;
+
+/// The longest side a provider takes in an attached image, which the
+/// provider or model declares. The refusal is per side and not per area — an
+/// endpoint that takes 1000x8000 can refuse 820x9000 — and endpoints say
+/// nothing about the limit when they refuse, so an undeclared limit cannot be
+/// inferred from the model's context window or replaced with a default.
+pub fn max_image_dimension_note(max_image_dimension: Option<u32>) -> Option<String> {
+    max_image_dimension.map(|dimension| {
+        format!(
+            " Images are attached only when both sides are at most {dimension} px; a larger image \
+             is reported rather than attached."
+        )
+    })
+}
 
 fn visible_text(text: impl Into<String>) -> ContentBlock {
     ContentBlock::Text(
@@ -74,8 +80,9 @@ impl ImageTool {
         &self,
         params: ImageReadParams,
         working_dir: Option<&Path>,
+        max_image_dimension: Option<u32>,
     ) -> CallToolResult {
-        match load_image(&params, working_dir).await {
+        match load_image(&params, working_dir, max_image_dimension).await {
             Ok(loaded) => {
                 let mut result = CallToolResult::success(vec![
                     visible_text(loaded.summary(&params.source)),
@@ -147,6 +154,7 @@ impl LoadedImage {
 async fn load_image(
     params: &ImageReadParams,
     working_dir: Option<&Path>,
+    max_image_dimension: Option<u32>,
 ) -> Result<LoadedImage, String> {
     if params.source.trim().is_empty() {
         return Err("source cannot be empty".to_string());
@@ -198,7 +206,7 @@ async fn load_image(
         }
     };
 
-    let encoded = shrink_to_budget(&subject, encoded)?;
+    let encoded = shrink_to_budget(&subject, encoded, max_image_dimension)?;
 
     Ok(LoadedImage {
         data: base64::prelude::BASE64_STANDARD.encode(&encoded.bytes),
@@ -243,9 +251,10 @@ impl std::fmt::Debug for EncodedImage {
 fn shrink_to_budget(
     source: &image::DynamicImage,
     encoded: EncodedImage,
+    max_image_dimension: Option<u32>,
 ) -> Result<EncodedImage, String> {
     if encoded.bytes.len() <= MAX_ENCODED_IMAGE_BYTES {
-        return within_max_edge(encoded);
+        return within_max_edge(encoded, max_image_dimension);
     }
 
     let (mut width, mut height) = (source.width(), source.height());
@@ -286,16 +295,23 @@ fn shrink_to_budget(
 /// refuses for its shape, so the dimensions are reported instead of being
 /// corrected: which detail to keep is a choice the model makes with a crop, and
 /// a downscale here would make that choice for it.
-fn within_max_edge(encoded: EncodedImage) -> Result<EncodedImage, String> {
+fn within_max_edge(
+    encoded: EncodedImage,
+    max_image_dimension: Option<u32>,
+) -> Result<EncodedImage, String> {
+    let Some(max_image_dimension) = max_image_dimension else {
+        return Ok(encoded);
+    };
+
     let longest = encoded.width.max(encoded.height);
-    if longest <= MAX_IMAGE_EDGE {
+    if longest <= max_image_dimension {
         return Ok(encoded);
     }
 
     Err(format!(
         "image is {}x{}; the provider accepts a side of at most {} px, so no image was attached. \
          The file is unchanged.",
-        encoded.width, encoded.height, MAX_IMAGE_EDGE,
+        encoded.width, encoded.height, max_image_dimension,
     ))
 }
 
@@ -517,7 +533,7 @@ mod local_file_tests {
         let file_url = url::Url::from_file_path(&path).unwrap().to_string();
 
         for source in [path.to_string_lossy().into_owned(), file_url] {
-            let loaded = load_image(&ImageReadParams { source, crop: None }, None)
+            let loaded = load_image(&ImageReadParams { source, crop: None }, None, None)
                 .await
                 .unwrap();
 
@@ -544,6 +560,7 @@ mod local_file_tests {
                 source: path.to_string_lossy().into_owned(),
                 crop: None,
             },
+            None,
             None,
         )
         .await
@@ -692,7 +709,7 @@ mod tests {
             crop: None,
         };
 
-        let loaded = load_image(&params, None).await.unwrap();
+        let loaded = load_image(&params, None, None).await.unwrap();
         server.await.unwrap();
 
         assert_eq!(loaded.mime_type, "image/png");
@@ -738,7 +755,7 @@ mod shrink_tests {
         let original = encoded(&image);
         let bytes = original.bytes.clone();
 
-        let fitted = shrink_to_budget(&image, original).expect("fits");
+        let fitted = shrink_to_budget(&image, original, None).expect("fits");
 
         assert!(!fitted.downscaled);
         assert_eq!(fitted.bytes, bytes);
@@ -756,7 +773,7 @@ mod shrink_tests {
             original.bytes.len()
         );
 
-        let fitted = shrink_to_budget(&image, original).expect("should fit once reduced");
+        let fitted = shrink_to_budget(&image, original, None).expect("should fit once reduced");
 
         assert!(fitted.downscaled);
         assert!(fitted.bytes.len() <= MAX_ENCODED_IMAGE_BYTES);
@@ -779,7 +796,7 @@ mod shrink_tests {
         let image = DynamicImage::ImageRgba8(image);
         let original = encoded(&image);
 
-        let fitted = shrink_to_budget(&image, original).expect("should fit once reduced");
+        let fitted = shrink_to_budget(&image, original, None).expect("should fit once reduced");
 
         assert!(fitted.downscaled);
         assert_eq!(fitted.mime_type, "image/png");
@@ -798,13 +815,16 @@ mod shrink_tests {
             downscaled: false,
         };
 
-        let error = shrink_to_budget(&image, original).expect_err("cannot fit");
+        let error = shrink_to_budget(&image, original, None).expect_err("cannot fit");
 
         assert!(error.contains("4.0 MiB"), "{error}");
         assert!(error.contains("MiB"), "{error}");
         assert!(error.contains("no image was attached"), "{error}");
         assert!(error.contains("unchanged"), "{error}");
     }
+
+    /// The limit a provider in these tests declares for itself.
+    const DECLARED_LIMIT: u32 = 8000;
 
     #[test]
     fn reports_an_image_the_provider_refuses_for_its_shape() {
@@ -815,7 +835,8 @@ mod shrink_tests {
         let original = encoded(&image);
         assert!(original.bytes.len() <= MAX_ENCODED_IMAGE_BYTES);
 
-        let error = shrink_to_budget(&image, original).expect_err("provider would refuse it");
+        let error =
+            shrink_to_budget(&image, original, Some(DECLARED_LIMIT)).expect_err("provider refuses");
 
         assert!(error.contains("9000x1"), "{error}");
         assert!(error.contains("8000"), "{error}");
@@ -825,12 +846,36 @@ mod shrink_tests {
 
     #[test]
     fn accepts_a_side_exactly_at_the_limit() {
-        let image = noisy(1, MAX_IMAGE_EDGE);
+        let image = noisy(1, DECLARED_LIMIT);
         let original = encoded(&image);
 
-        let fitted = shrink_to_budget(&image, original).expect("at the limit");
+        let fitted =
+            shrink_to_budget(&image, original, Some(DECLARED_LIMIT)).expect("at the limit");
 
         assert!(!fitted.downscaled);
+    }
+
+    #[test]
+    fn attaches_the_same_image_when_no_limit_is_declared() {
+        // An endpoint that declares no limit cannot be assumed to accept any
+        // size, but neither can a limit be invented for it: the image goes as
+        // it is, exactly as it did before a limit could be declared.
+        let image = noisy(9000, 1);
+
+        let fitted = shrink_to_budget(&image, encoded(&image), None).expect("undeclared");
+
+        assert!(!fitted.downscaled);
+        assert_eq!((fitted.width, fitted.height), (9000, 1));
+    }
+
+    #[test]
+    fn the_description_note_names_the_declared_limit() {
+        assert_eq!(max_image_dimension_note(None), None);
+
+        let note = max_image_dimension_note(Some(8192)).expect("note");
+
+        assert!(note.contains("8192"), "{note}");
+        assert!(note.contains("reported rather than attached"), "{note}");
     }
 
     #[test]

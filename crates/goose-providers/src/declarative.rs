@@ -179,6 +179,13 @@ pub struct DeclarativeProviderConfig {
     /// refusal.
     #[serde(default)]
     pub max_request_bytes: Option<usize>,
+    /// The longest side, in pixels, this provider accepts in an attached image.
+    /// A model entry that declares its own takes precedence. Endpoints refuse
+    /// an over-long image with a 400 that names no limit, so a request carrying
+    /// one fails whole; declaring this lets goose report the limitation before
+    /// the image is attached instead of after the refusal.
+    #[serde(default)]
+    pub max_image_dimension: Option<u32>,
     pub supports_streaming: Option<bool>,
     #[serde(default = "default_requires_auth")]
     pub requires_auth: bool,
