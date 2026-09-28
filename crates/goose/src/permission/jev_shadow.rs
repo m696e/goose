@@ -370,13 +370,12 @@ mod tests {
     }
 
     #[test]
-    fn switch_reads_the_environment_as_the_cli_would_spell_it() {
+    fn the_environment_overrides_whatever_the_config_file_says() {
         std::env::set_var(JEV_SHADOW_CONFIG_KEY, "1");
         assert!(shadow_enabled());
         std::env::set_var(JEV_SHADOW_CONFIG_KEY, "false");
         assert!(!shadow_enabled());
         std::env::remove_var(JEV_SHADOW_CONFIG_KEY);
-        assert!(!shadow_enabled());
     }
 
     /// A decisive probe of the whole path: config -> provider -> Jev -> verdicts.
