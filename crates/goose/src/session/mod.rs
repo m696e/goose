@@ -5,6 +5,7 @@ mod export_html;
 mod export_markdown;
 pub mod extension_data;
 pub mod import_formats;
+pub mod jev_decision;
 mod last_message_snippet;
 mod legacy;
 pub mod session_manager;
@@ -24,6 +25,7 @@ pub use export_markdown::{
 pub use extension_data::{
     EnabledExtensionsState, ExtensionData, ExtensionState, GoalState, TodoState,
 };
+pub use jev_decision::{JevDecisionRecord, StoredJevDecision};
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
     StoredCompactionEvent,
