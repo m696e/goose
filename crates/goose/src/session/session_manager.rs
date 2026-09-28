@@ -2284,7 +2284,7 @@ impl SessionStorage {
         .bind(&decision.request_id)
         .bind(&decision.tool_name)
         .bind(&decision.arguments)
-        .bind(decision.read_only as i64)
+        .bind(decision.read_only.map(|value| value as i64))
         .bind(decision.probability)
         .bind(decision.confidence)
         .bind(&decision.model)
@@ -2327,7 +2327,7 @@ impl SessionStorage {
                     created_at,
                     request_id,
                     tool_name: tool_name.unwrap_or_default(),
-                    read_only: read_only.unwrap_or(0) != 0,
+                    read_only: read_only.map(|value| value != 0),
                     probability,
                     confidence,
                     model: model.unwrap_or_default(),
@@ -5612,7 +5612,7 @@ mod tests {
             request_id: "r1".to_string(),
             tool_name: "developer__shell".to_string(),
             arguments: "{}".to_string(),
-            read_only: true,
+            read_only: Some(true),
             probability: 0.9,
             confidence: 0.9,
             model: "typesafe/jev-1.13".to_string(),
@@ -5663,7 +5663,7 @@ mod tests {
             request_id: "r1".to_string(),
             tool_name: "developer__shell".to_string(),
             arguments: "{\"command\":\"ls\"}".to_string(),
-            read_only: true,
+            read_only: Some(true),
             probability: 0.93,
             confidence: 0.88,
             model: "typesafe/jev-1.13".to_string(),
@@ -5681,7 +5681,7 @@ mod tests {
             request_id: "r2".to_string(),
             tool_name: "developer__write".to_string(),
             arguments: "{}".to_string(),
-            read_only: false,
+            read_only: Some(false),
             probability: 0.02,
             confidence: 0.99,
             model: "typesafe/jev-1.13".to_string(),
@@ -5697,10 +5697,10 @@ mod tests {
         let stored = sm.list_jev_decisions(&id).await.unwrap();
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].request_id, "r1");
-        assert!(stored[0].read_only);
+        assert_eq!(stored[0].read_only, Some(true));
         assert_eq!(stored[0].judge_read_only, Some(true));
         assert_eq!(stored[0].outcome, "agreed_read_only");
-        assert!(!stored[1].read_only);
+        assert_eq!(stored[1].read_only, Some(false));
         assert_eq!(stored[1].model, "typesafe/jev-1.13");
     }
 
