@@ -284,6 +284,13 @@ impl PlatformExtensionContext {
     ) -> Result<goose_providers::model::ModelConfig, String> {
         if let Ok(session) = self.session_manager.get_session(session_id, false).await {
             if let Some(model_config) = session.model_config {
+                let model_config = match session.provider_name.as_deref() {
+                    Some(provider_name) => crate::model_config::with_rederived_image_dimension(
+                        provider_name,
+                        model_config,
+                    ),
+                    None => model_config,
+                };
                 return Ok(model_config);
             }
         }

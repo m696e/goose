@@ -10,7 +10,7 @@ use crate::agents::ToolCallContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use edit::{EditTools, FileEditParams, FileWriteParams};
-use image::{ImageReadParams, ImageTool};
+use image::{max_image_dimension_note, ImageReadParams, ImageTool};
 use indoc::indoc;
 use rmcp::model::{
     Annotations, CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject,
@@ -37,6 +37,7 @@ pub struct DeveloperClient {
     edit_tools: Arc<EditTools>,
     tree_tool: Arc<TreeTool>,
     image_tool: Arc<ImageTool>,
+    context: PlatformExtensionContext,
 }
 
 fn developer_instructions() -> &'static str {
@@ -85,6 +86,7 @@ impl DeveloperClient {
             edit_tools: Arc::new(EditTools::new()),
             tree_tool: Arc::new(TreeTool::new()),
             image_tool: Arc::new(ImageTool::new()),
+            context,
         })
     }
 
@@ -105,7 +107,18 @@ impl DeveloperClient {
         serde_json::from_value(value).map_err(|e| format!("Failed to parse arguments: {e}"))
     }
 
-    pub(crate) fn get_tools() -> Vec<Tool> {
+    /// The longest image side the active model's endpoint takes, when its
+    /// provider or model declares one. Read per session so a session's tool
+    /// schema states the limit the session is actually subject to.
+    async fn max_image_dimension(&self, session_id: &str) -> Option<u32> {
+        self.context
+            .model_config_for_session(session_id)
+            .await
+            .ok()
+            .and_then(|model_config| model_config.max_image_dimension)
+    }
+
+    pub(crate) fn get_tools(max_image_dimension: Option<u32>) -> Vec<Tool> {
         vec![
             Tool::new(
                 "write".to_string(),
@@ -171,7 +184,11 @@ impl DeveloperClient {
             )),
             Tool::new(
                 "read_image".to_string(),
-                "Read an image from a local file path or http(s) URL and return it as image content for the model to inspect. Supports png, jpeg, gif, and webp.".to_string(),
+                format!(
+                    "Read an image from a local file path or http(s) URL and return it as image \
+                     content for the model to inspect. Supports png, jpeg, gif, and webp.{}",
+                    max_image_dimension_note(max_image_dimension).unwrap_or_default(),
+                ),
                 Self::schema::<ImageReadParams>(),
             )
             .annotate(ToolAnnotations::from_raw(
@@ -189,12 +206,14 @@ impl DeveloperClient {
 impl McpClientTrait for DeveloperClient {
     async fn list_tools(
         &self,
-        _session_id: &str,
+        session_id: &str,
         _next_cursor: Option<String>,
         _cancellation_token: CancellationToken,
     ) -> Result<ListToolsResult, Error> {
+        let max_image_dimension = self.max_image_dimension(session_id).await;
+
         Ok(ListToolsResult {
-            tools: Self::get_tools(),
+            tools: Self::get_tools(max_image_dimension),
             next_cursor: None,
             meta: None,
             ..Default::default()
@@ -242,10 +261,13 @@ impl McpClientTrait for DeveloperClient {
                 ))])),
             },
             "read_image" => match Self::parse_args::<ImageReadParams>(arguments) {
-                Ok(params) => Ok(self
-                    .image_tool
-                    .image_read_with_cwd(params, working_dir)
-                    .await),
+                Ok(params) => {
+                    let max_image_dimension = self.max_image_dimension(&ctx.session_id).await;
+                    Ok(self
+                        .image_tool
+                        .image_read_with_cwd(params, working_dir, max_image_dimension)
+                        .await)
+                }
                 Err(error) => Ok(CallToolResult::error(vec![visible_text(format!(
                     "Error: {error}"
                 ))])),
@@ -271,7 +293,7 @@ mod tests {
 
     #[test]
     fn developer_tools_are_flat() {
-        let names: Vec<String> = DeveloperClient::get_tools()
+        let names: Vec<String> = DeveloperClient::get_tools(None)
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
@@ -281,7 +303,7 @@ mod tests {
 
     #[test]
     fn read_image_annotations_reflect_network_access() {
-        let read_image = DeveloperClient::get_tools()
+        let read_image = DeveloperClient::get_tools(None)
             .into_iter()
             .find(|tool| tool.name == "read_image")
             .unwrap();
@@ -289,6 +311,26 @@ mod tests {
 
         assert_eq!(annotations.read_only_hint, Some(false));
         assert_eq!(annotations.open_world_hint, Some(true));
+    }
+
+    #[test]
+    fn read_image_description_states_a_declared_limit() {
+        let description = |max_image_dimension| {
+            DeveloperClient::get_tools(max_image_dimension)
+                .into_iter()
+                .find(|tool| tool.name == "read_image")
+                .unwrap()
+                .description
+                .unwrap()
+                .to_string()
+        };
+
+        assert!(description(None).ends_with("Supports png, jpeg, gif, and webp."));
+        assert!(
+            description(Some(8192)).contains("both sides are at most 8192 px"),
+            "{}",
+            description(Some(8192))
+        );
     }
 
     fn test_context(data_dir: std::path::PathBuf) -> PlatformExtensionContext {

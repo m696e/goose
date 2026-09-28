@@ -1816,6 +1816,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2052,6 +2053,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2097,6 +2099,7 @@ mod tests {
                 request_params: None,
                 reasoning: None,
                 supports_vision: None,
+                max_image_dimension: None,
                 request_headers: None,
             };
 
@@ -2226,6 +2229,7 @@ mod tests {
                 request_params: None,
                 reasoning: None,
                 supports_vision: None,
+                max_image_dimension: None,
                 request_headers: None,
             };
 
@@ -2410,6 +2414,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2437,6 +2442,7 @@ mod tests {
             )])),
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2463,6 +2469,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2513,6 +2520,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2551,6 +2559,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2584,6 +2593,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2616,6 +2626,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2651,6 +2662,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2691,6 +2703,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2718,6 +2731,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2751,6 +2765,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -2846,6 +2861,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -3287,6 +3303,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -3320,6 +3337,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 
@@ -3353,6 +3371,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            max_image_dimension: None,
             request_headers: None,
         };
 

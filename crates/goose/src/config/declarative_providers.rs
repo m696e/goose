@@ -229,6 +229,7 @@ pub fn create_custom_provider(
         stream_chunk_timeout_secs: None,
         stream_first_line_timeout_secs: None,
         max_request_bytes: None,
+        max_image_dimension: None,
         supports_streaming: params.supports_streaming,
         requires_auth: params.requires_auth,
         catalog_provider_id: params.catalog_provider_id,
@@ -311,6 +312,8 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
                         .supports_cache_control
                         .or(existing.supports_cache_control);
                     model.supports_vision = model.supports_vision.or(existing.supports_vision);
+                    model.max_image_dimension =
+                        model.max_image_dimension.or(existing.max_image_dimension);
                     model.reasoning |= existing.reasoning;
                     model.thinking_preservation_format = model
                         .thinking_preservation_format
@@ -348,6 +351,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
             stream_chunk_timeout_secs: existing_config.stream_chunk_timeout_secs,
             stream_first_line_timeout_secs: existing_config.stream_first_line_timeout_secs,
             max_request_bytes: None,
+            max_image_dimension: existing_config.max_image_dimension,
             supports_streaming: params.supports_streaming,
             requires_auth: params.requires_auth,
             catalog_provider_id: params.catalog_provider_id,
@@ -618,6 +622,7 @@ mod tests {
                 currency: None,
                 supports_cache_control: None,
                 supports_vision: None,
+                max_image_dimension: None,
                 reasoning: false,
                 thinking_preservation_format: None,
                 request_params: None,
@@ -628,6 +633,7 @@ mod tests {
             stream_chunk_timeout_secs: None,
             stream_first_line_timeout_secs: None,
             max_request_bytes: None,
+            max_image_dimension: None,
             supports_streaming: Some(true),
             requires_auth: true,
             catalog_provider_id: Some("huggingface".to_string()),

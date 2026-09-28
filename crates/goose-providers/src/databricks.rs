@@ -520,6 +520,7 @@ impl DatabricksProvider {
             currency: None,
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning,
             thinking_preservation_format: None,
             request_params: None,

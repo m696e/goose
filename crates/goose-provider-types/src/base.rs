@@ -267,6 +267,11 @@ pub struct ModelInfo {
     /// callers should fall back to canonical metadata before assuming no vision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// The longest side, in pixels, this model's endpoint accepts in an
+    /// attached image. `None` means the limit is not declared, which callers
+    /// must read as unknown rather than as generous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_dimension: Option<u32>,
     /// Whether this model supports reasoning/thinking controls
     #[serde(default)]
     pub reasoning: bool,
@@ -288,10 +293,16 @@ impl ModelInfo {
             currency: None,
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
         }
+    }
+
+    pub fn with_max_image_dimension(mut self, max_image_dimension: u32) -> Self {
+        self.max_image_dimension = Some(max_image_dimension);
+        self
     }
 
     pub fn with_context_limit(mut self, context_limit: usize) -> Self {
@@ -320,6 +331,7 @@ impl ModelInfo {
             currency: Some("$".to_string()),
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -381,6 +393,7 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
                 .input
                 .contains(&crate::canonical::Modality::Image)
         }),
+        max_image_dimension: None,
         reasoning,
         thinking_preservation_format: None,
         request_params: None,
@@ -1125,6 +1138,7 @@ mod tests {
             currency: None,
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -1141,6 +1155,7 @@ mod tests {
             currency: None,
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
@@ -1157,6 +1172,7 @@ mod tests {
             currency: None,
             supports_cache_control: None,
             supports_vision: None,
+            max_image_dimension: None,
             reasoning: false,
             thinking_preservation_format: None,
             request_params: None,
