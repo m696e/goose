@@ -3857,9 +3857,9 @@ mod tests {
 
     fn assert_usage_yielded_once(
         result: &StreamingUsageTestResult,
-        expected_input: i32,
-        expected_output: i32,
-        expected_total: i32,
+        expected_input: TokenCount,
+        expected_output: TokenCount,
+        expected_total: TokenCount,
     ) {
         assert_eq!(
             result.usage_count, 1,
