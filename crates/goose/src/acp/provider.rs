@@ -16,7 +16,7 @@ use agent_client_protocol_schema::v1::AGENT_METHOD_NAMES;
 use anyhow::{Context, Result};
 use async_stream::try_stream;
 use futures::future::BoxFuture;
-use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::conversation::token_usage::{ProviderUsage, TokenCount, Usage};
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock as RmcpContent, Role, Tool};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -1054,9 +1054,9 @@ impl Provider for AcpProvider {
                             let provider_usage = ProviderUsage::new(
                                 model_name.clone(),
                                 Usage::new(
-                                    Some(usage.input_tokens as i32),
-                                    Some(usage.output_tokens as i32),
-                                    Some(usage.total_tokens as i32),
+                                    Some(usage.input_tokens as TokenCount),
+                                    Some(usage.output_tokens as TokenCount),
+                                    Some(usage.total_tokens as TokenCount),
                                 ),
                             );
                             yield (None, Some(provider_usage));

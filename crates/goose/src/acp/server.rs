@@ -27,6 +27,7 @@ use crate::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
     ToolConfirmationRequest, ToolRequest, ToolResponse,
 };
+use crate::conversation::token_usage::TokenCount;
 use crate::conversation::Conversation;
 use crate::execution::manager::{AgentManager, AgentManagerGetResult, RuntimeContext};
 use crate::permission::permission_confirmation::PrincipalType;
@@ -721,7 +722,7 @@ fn builtin_to_extension_config(name: &str) -> ExtensionConfig {
     }
 }
 
-fn to_nonnegative_u64(value: Option<i32>) -> Option<u64> {
+fn to_nonnegative_u64(value: Option<TokenCount>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
 

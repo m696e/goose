@@ -85,6 +85,11 @@ impl ProviderUsage {
     }
 }
 
+/// A count of tokens. 64-bit: these are summed over the life of a session,
+/// and a long one passes `i32::MAX`, which a 32-bit accumulator cannot
+/// represent at all. Persisted columns are SQLite `INTEGER`, also 64-bit.
+pub type TokenCount = i64;
+
 /// `input_tokens` is the total input including cache read/write tokens;
 /// the cache fields are breakdown subsets of it. Parsers for providers
 /// that report cache tokens separately from input (e.g. Anthropic,
@@ -93,11 +98,11 @@ impl ProviderUsage {
 pub struct Usage {
     /// All prompt tokens, including any served from or written to cache.
     /// `cache_read_input_tokens` and `cache_write_input_tokens` are subsets of this.
-    pub input_tokens: Option<i32>,
-    pub output_tokens: Option<i32>,
-    pub total_tokens: Option<i32>,
-    pub cache_read_input_tokens: Option<i32>,
-    pub cache_write_input_tokens: Option<i32>,
+    pub input_tokens: Option<TokenCount>,
+    pub output_tokens: Option<TokenCount>,
+    pub total_tokens: Option<TokenCount>,
+    pub cache_read_input_tokens: Option<TokenCount>,
+    pub cache_write_input_tokens: Option<TokenCount>,
 }
 
 fn sum_optionals<T>(a: Option<T>, b: Option<T>) -> Option<T>
@@ -139,9 +144,9 @@ impl AddAssign for Usage {
 
 impl Usage {
     pub fn new(
-        input_tokens: Option<i32>,
-        output_tokens: Option<i32>,
-        total_tokens: Option<i32>,
+        input_tokens: Option<TokenCount>,
+        output_tokens: Option<TokenCount>,
+        total_tokens: Option<TokenCount>,
     ) -> Self {
         let calculated_total = if total_tokens.is_none() {
             match (input_tokens, output_tokens) {
@@ -165,8 +170,8 @@ impl Usage {
 
     pub fn with_cache_tokens(
         mut self,
-        cache_read_input_tokens: Option<i32>,
-        cache_write_input_tokens: Option<i32>,
+        cache_read_input_tokens: Option<TokenCount>,
+        cache_write_input_tokens: Option<TokenCount>,
     ) -> Self {
         self.cache_read_input_tokens = cache_read_input_tokens;
         self.cache_write_input_tokens = cache_write_input_tokens;
@@ -176,11 +181,11 @@ impl Usage {
     /// For providers whose reported `input_tokens`/`total_tokens` exclude
     /// cache tokens (e.g. Anthropic, Bedrock): folds the cache breakdown in.
     pub fn from_cache_exclusive_input(
-        input_tokens: Option<i32>,
-        output_tokens: Option<i32>,
-        total_tokens: Option<i32>,
-        cache_read_input_tokens: Option<i32>,
-        cache_write_input_tokens: Option<i32>,
+        input_tokens: Option<TokenCount>,
+        output_tokens: Option<TokenCount>,
+        total_tokens: Option<TokenCount>,
+        cache_read_input_tokens: Option<TokenCount>,
+        cache_write_input_tokens: Option<TokenCount>,
     ) -> Self {
         let cache_tokens = cache_read_input_tokens
             .unwrap_or(0)

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::future::BoxFuture;
-use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::conversation::token_usage::{ProviderUsage, TokenCount, Usage};
 use goose_providers::thinking::ThinkingEffort;
 use serde_json::json;
 use std::collections::HashMap;
@@ -298,19 +298,19 @@ impl CodexProvider {
             usage.input_tokens = usage_info
                 .get("input_tokens")
                 .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+                .map(|v| v as TokenCount);
         }
         if usage.output_tokens.is_none() {
             usage.output_tokens = usage_info
                 .get("output_tokens")
                 .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+                .map(|v| v as TokenCount);
         }
         if usage.cache_read_input_tokens.is_none() {
             usage.cache_read_input_tokens = usage_info
                 .get("cached_input_tokens")
                 .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
+                .map(|v| v as TokenCount);
         }
     }
 

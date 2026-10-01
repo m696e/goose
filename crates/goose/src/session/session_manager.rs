@@ -1,6 +1,7 @@
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
+use crate::conversation::token_usage::TokenCount;
 use crate::conversation::Conversation;
 use crate::providers::base::CostSource;
 use crate::providers::base::Provider;
@@ -2669,8 +2670,8 @@ impl SessionStorage {
                 String,
                 Option<String>,
                 Option<String>,
-                Option<i32>,
-                Option<i32>,
+                Option<TokenCount>,
+                Option<TokenCount>,
                 String,
             ),
         >(
@@ -3180,7 +3181,7 @@ impl SessionStorage {
             }
         }
 
-        let opt = |v: i64| Some(i32::try_from(v).unwrap_or(i32::MAX));
+        let opt = |v: i64| Some(v);
         Ok(SessionUsageTotals {
             accumulated_usage: Usage::new(opt(input), opt(output), opt(total))
                 .with_cache_tokens(opt(cache_read), opt(cache_write)),
@@ -5342,14 +5343,14 @@ mod tests {
 
                 sm.update(&session.id)
                     .user_provided_name(format!("Updated session {}", i))
-                    .usage(Usage::new(None, None, Some(100 * i)))
+                    .usage(Usage::new(None, None, Some(i64::from(100 * i))))
                     .apply()
                     .await
                     .unwrap();
 
                 let updated = sm.get_session(&session.id, true).await.unwrap();
                 assert_eq!(updated.message_count, 2);
-                assert_eq!(updated.usage.total_tokens, Some(100 * i));
+                assert_eq!(updated.usage.total_tokens, Some(i64::from(100 * i)));
 
                 session.id
             });
@@ -5924,7 +5925,7 @@ mod tests {
         assert_eq!(sm.list_jev_decisions(&id).await.unwrap().len(), 1);
     }
 
-    fn message_usage(input: i32, output: i32, cost: f64, is_compaction: bool) -> MessageUsage {
+    fn message_usage(input: i64, output: i64, cost: f64, is_compaction: bool) -> MessageUsage {
         MessageUsage {
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -6229,6 +6230,27 @@ mod tests {
         let totals = sm.get_session_usage_totals(&id).await.unwrap();
         assert_eq!(totals.accumulated_usage.input_tokens, Some(500));
         assert_eq!(totals.accumulated_cost, Some(0.42));
+    }
+
+    #[tokio::test]
+    async fn a_session_accumulated_past_i32_max_still_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+
+        // A long session sums past `i32::MAX`, which a 32-bit accumulator
+        // cannot represent at all. The column is a SQLite INTEGER, so the row
+        // must read back intact instead of failing the whole session load.
+        let tokens: TokenCount = 2_147_556_048;
+
+        sm.update(&id)
+            .accumulated_usage(Usage::new(Some(tokens), Some(1), Some(tokens)))
+            .apply()
+            .await
+            .unwrap();
+
+        let loaded = sm.get_session(&id, true).await.unwrap();
+        assert_eq!(loaded.accumulated_usage.total_tokens, Some(tokens));
     }
 
     #[tokio::test]

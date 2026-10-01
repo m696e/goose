@@ -1,4 +1,4 @@
-use crate::conversation::token_usage::{ProviderUsage, Usage};
+use crate::conversation::token_usage::{ProviderUsage, TokenCount, Usage};
 use crate::documents::{
     document_media_type_is_supported, unsupported_document_text, UNSUPPORTED_MEDIA_TYPE_REASON,
 };
@@ -408,7 +408,7 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
         let input_tokens = usage_meta_data
             .get("promptTokenCount")
             .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .map(|v| v as TokenCount);
         // `candidatesTokenCount` is the visible output; thinking models
         // (Gemini 2.5/3) report reasoning tokens separately in
         // `thoughtsTokenCount`, and per the API spec `totalTokenCount` =
@@ -426,18 +426,18 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
         let output_tokens = match (candidates_tokens, thoughts_tokens) {
             (None, None) => None,
             (candidates, thoughts) => {
-                Some((candidates.unwrap_or(0) + thoughts.unwrap_or(0)) as i32)
+                Some((candidates.unwrap_or(0) + thoughts.unwrap_or(0)) as TokenCount)
             }
         };
         let total_tokens = usage_meta_data
             .get("totalTokenCount")
             .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .map(|v| v as TokenCount);
         // promptTokenCount already includes cachedContentTokenCount
         let cached_tokens = usage_meta_data
             .get("cachedContentTokenCount")
             .and_then(|v| v.as_u64())
-            .map(|v| v as i32);
+            .map(|v| v as TokenCount);
         Ok(Usage::new(input_tokens, output_tokens, total_tokens)
             .with_cache_tokens(cached_tokens, None))
     } else {

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::conversation::message::Message;
+use crate::conversation::token_usage::TokenCount;
 use crate::conversation::Conversation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +61,8 @@ pub struct CompactionEvent {
     /// Text the model asked to keep verbatim across a compaction it requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry: Option<String>,
-    pub before_tokens: Option<i32>,
-    pub after_tokens: Option<i32>,
+    pub before_tokens: Option<TokenCount>,
+    pub after_tokens: Option<TokenCount>,
     pub archived_message_ids: Vec<String>,
 }
 
@@ -71,8 +72,8 @@ impl CompactionEvent {
         reason: Option<String>,
         before: &Conversation,
         after: &Conversation,
-        before_tokens: Option<i32>,
-        after_tokens: Option<i32>,
+        before_tokens: Option<TokenCount>,
+        after_tokens: Option<TokenCount>,
     ) -> Self {
         Self {
             trigger,

@@ -18,6 +18,7 @@ use crate::context_mgmt::{compact_messages, count_context_tokens};
 use crate::conversation::message::{
     Message, MessageContent, MessageErrorKind, SystemNotificationType,
 };
+use crate::conversation::token_usage::TokenCount;
 use crate::conversation::{Conversation, EffectiveRole};
 use crate::providers::base::Provider;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
@@ -29,7 +30,7 @@ const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation..."
 pub(super) const MAX_CONTEXT_ERROR_COMPACTIONS: usize = 2;
 
 fn compaction_part(
-    total_tokens: Option<i32>,
+    total_tokens: Option<TokenCount>,
     context_limit: usize,
     threshold: f64,
     session_modification_permitted: bool,
@@ -39,7 +40,7 @@ fn compaction_part(
         return None;
     }
 
-    let compaction_at = (context_limit as f64 * threshold) as i32;
+    let compaction_at = (context_limit as f64 * threshold) as TokenCount;
     if compaction_at <= 0 || (total_tokens as f64 / compaction_at as f64) < 0.5 {
         return None;
     }
@@ -74,7 +75,7 @@ fn awaits_tool_responses(messages: &[Message]) -> bool {
 
 /// Reported usage stops at the inference that requested the tools, so the
 /// results that answered it are not counted until the next request.
-async fn unreported_tool_tokens(conversation: &Conversation) -> Result<i32> {
+async fn unreported_tool_tokens(conversation: &Conversation) -> Result<TokenCount> {
     let messages = conversation.messages();
     if last_effective_role(messages)? != EffectiveRole::Tool {
         return Ok(0);
@@ -118,7 +119,11 @@ impl CompactionOperation {
         (tokens as f64 / self.context_limit as f64) > self.threshold
     }
 
-    async fn context_tokens(&self, session: &Session, conversation: &Conversation) -> Result<i32> {
+    async fn context_tokens(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+    ) -> Result<TokenCount> {
         match session.usage.total_tokens {
             Some(tokens) => Ok(tokens + unreported_tool_tokens(conversation).await?),
             None => count_context_tokens(conversation.messages()).await,
@@ -160,7 +165,7 @@ impl CompactionOperation {
         conversation: &Conversation,
         destroy: bool,
         emit: &Emitter,
-        before_tokens: Option<i32>,
+        before_tokens: Option<TokenCount>,
     ) -> Result<OperationResult<GooseEffect>> {
         let command = messages_since_kickoff(conversation)?
             .first()

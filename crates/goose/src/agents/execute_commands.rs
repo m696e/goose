@@ -238,7 +238,7 @@ impl Agent {
             &conversation,
             &compacted,
             session.usage.total_tokens,
-            Some(compaction.retained_context_tokens as i32),
+            Some(compaction.retained_context_tokens),
         );
         manager
             .save_compacted_conversation(session_id, &compacted, &event)
