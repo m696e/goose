@@ -960,6 +960,124 @@ fn user_visible_message_sql(column: &str) -> String {
     format!("COALESCE(json_extract({column}, '$.userVisible'), 1) != 0")
 }
 
+/// Replaces reasoning text when the message it belongs to is elided.
+const ELIDED_REASONING: &str = "[reasoning elided]";
+
+/// What a message keeps once the agent can no longer see it.
+///
+/// An agent-invisible message is never sent to a provider again, but its row
+/// stays on record for the session view and for `/archive`, both of which read
+/// only the text. Two things it carries are large and unreadable at rest — the
+/// base64 image payloads and the reasoning — and together they are most of a
+/// long session's database. Both become a short note, so what a person reads is
+/// unchanged while the bytes are not carried forever.
+///
+/// Returns `None` when there is nothing to elide, so callers can skip the write.
+fn elide_unseen_content(content_json: &str) -> Option<String> {
+    let mut content: serde_json::Value = serde_json::from_str(content_json).ok()?;
+    if !elide_unseen_value(&mut content) {
+        return None;
+    }
+    serde_json::to_string(&content).ok()
+}
+
+fn elide_unseen_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items.iter_mut() {
+                changed |= elide_unseen_value(item);
+            }
+            changed
+        }
+        serde_json::Value::Object(fields) => {
+            match fields.get("type").and_then(serde_json::Value::as_str) {
+                Some("image") => {
+                    let mime = fields
+                        .get("mimeType")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("image")
+                        .to_string();
+                    let encoded = fields
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    fields.clear();
+                    fields.insert("type".to_string(), serde_json::Value::from("text"));
+                    fields.insert(
+                        "text".to_string(),
+                        serde_json::Value::from(format!(
+                            "[image elided: {mime}, {} KiB of base64]",
+                            encoded / 1024
+                        )),
+                    );
+                    return true;
+                }
+                Some("thinking") => {
+                    let Some(text) = fields.get_mut("thinking") else {
+                        return false;
+                    };
+                    let Some(reasoning) = text.as_str() else {
+                        return false;
+                    };
+                    if reasoning.len() <= ELIDED_REASONING.len() {
+                        return false;
+                    }
+                    *text = serde_json::Value::from(ELIDED_REASONING);
+                    return true;
+                }
+                _ => {}
+            }
+            let mut changed = false;
+            for field in fields.values_mut() {
+                changed |= elide_unseen_value(field);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// The serialized content to store for `message`, elided when the agent will
+/// not see it again.
+fn stored_content_json(message: &Message) -> Result<String> {
+    let content = serde_json::to_string(&message.content)?;
+    if message.metadata.agent_visible {
+        return Ok(content);
+    }
+    Ok(elide_unseen_content(&content).unwrap_or(content))
+}
+
+/// Elide the heavy parts of a stored message that has just been made
+/// agent-invisible.
+async fn elide_stored_message_content(
+    tx: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    message_id: &str,
+) -> Result<()> {
+    let Some(content_json) = sqlx::query_scalar::<_, String>(
+        "SELECT content_json FROM messages WHERE session_id = ? AND message_id = ?",
+    )
+    .bind(session_id)
+    .bind(message_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(elided) = elide_unseen_content(&content_json) else {
+        return Ok(());
+    };
+    sqlx::query("UPDATE messages SET content_json = ? WHERE session_id = ? AND message_id = ?")
+        .bind(elided)
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
 fn session_sort_at(session: &Session) -> DateTime<Utc> {
     session.last_message_at.unwrap_or(session.updated_at)
 }
@@ -1163,12 +1281,17 @@ impl SessionStorage {
             }
         }
 
+        // Incremental auto-vacuum so pages freed by a deletion or by the
+        // content elision below go back to the filesystem instead of being
+        // held until the file's high-water mark is reached again. It applies
+        // to an existing database only after one `VACUUM`.
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(30))
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
 
         SqlitePoolOptions::new().connect_lazy_with(options)
     }
@@ -2205,7 +2328,7 @@ impl SessionStorage {
         .bind(message_id)
         .bind(session_id)
         .bind(role_to_string(&message.role))
-        .bind(serde_json::to_string(&message.content)?)
+        .bind(stored_content_json(message)?)
         .bind(created)
         .bind(metadata_json)
         .execute(&mut *tx)
@@ -2405,7 +2528,7 @@ impl SessionStorage {
             .bind(message_id)
             .bind(session_id)
             .bind(role_to_string(&message.role))
-            .bind(serde_json::to_string(&message.content)?)
+            .bind(stored_content_json(message)?)
             .bind(message.created)
             .bind(metadata_json)
             .execute(&mut *tx)
@@ -2459,6 +2582,9 @@ impl SessionStorage {
                 .bind(message_id)
                 .execute(&mut *tx)
                 .await?;
+                if !metadata.agent_visible {
+                    elide_stored_message_content(&mut tx, session_id, message_id).await?;
+                }
             } else {
                 sqlx::query(
                     "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, ?, ?, ?, ?, ?)",
@@ -2466,7 +2592,7 @@ impl SessionStorage {
                 .bind(message_id)
                 .bind(session_id)
                 .bind(role_to_string(&message.role))
-                .bind(serde_json::to_string(&message.content)?)
+                .bind(stored_content_json(message)?)
                 .bind(message.created)
                 .bind(serde_json::to_string(&message.metadata)?)
                 .execute(&mut *tx)
@@ -2509,9 +2635,10 @@ impl SessionStorage {
             )
             .bind(serde_json::to_string(&metadata)?)
             .bind(session_id)
-            .bind(message_id)
+            .bind(&message_id)
             .execute(&mut *tx)
             .await?;
+            elide_stored_message_content(&mut tx, session_id, &message_id).await?;
         }
 
         Self::insert_compaction_event(&mut tx, session_id, event).await?;
@@ -3258,6 +3385,10 @@ impl SessionStorage {
         .execute(&mut *tx)
         .await?;
 
+        if !new_metadata.agent_visible {
+            elide_stored_message_content(&mut tx, session_id, message_id).await?;
+        }
+
         tx.commit().await?;
 
         Ok(())
@@ -3388,11 +3519,13 @@ fn merge_tool_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::message::{Message, MessageContent};
+    use crate::conversation::message::{
+        Message, MessageContent, MessageContentBlock, ThinkingContentBlock, ToolResponse,
+    };
     use crate::providers::base::MessageStream;
     use goose_providers::conversation::token_usage::{CostSource, ProviderUsage};
     use goose_providers::errors::ProviderError;
-    use rmcp::model::Tool;
+    use rmcp::model::{CallToolResult, ContentBlock, ImageContent, TextContent, Tool};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3463,6 +3596,160 @@ mod tests {
         assert_eq!(events[0].event.trigger, CompactionTrigger::Clear);
         assert_eq!(events[0].event.archived_message_ids, vec!["keep"]);
         assert!(archive_summary(&events).unwrap().contains("1 message(s)"));
+    }
+
+    #[test]
+    fn eliding_an_image_leaves_a_note_in_its_place() {
+        let content = serde_json::to_string(&vec![MessageContentBlock::image(
+            "A".repeat(4096),
+            "image/jpeg",
+        )])
+        .unwrap();
+
+        let elided = elide_unseen_content(&content).unwrap();
+
+        assert!(elided.contains("[image elided: image/jpeg, 4 KiB of base64]"));
+        assert!(!elided.contains("AAAA"));
+    }
+
+    #[test]
+    fn eliding_replaces_long_reasoning_but_leaves_short_reasoning_alone() {
+        let long =
+            serde_json::to_string(&vec![MessageContentBlock::Thinking(ThinkingContentBlock {
+                thinking: "t".repeat(500),
+                signature: "sig".to_string(),
+            })])
+            .unwrap();
+        let elided = elide_unseen_content(&long).unwrap();
+        assert!(elided.contains(ELIDED_REASONING));
+        assert!(!elided.contains("tttt"));
+
+        let short =
+            serde_json::to_string(&vec![MessageContentBlock::Thinking(ThinkingContentBlock {
+                thinking: "brief".to_string(),
+                signature: String::new(),
+            })])
+            .unwrap();
+        assert!(elide_unseen_content(&short).is_none());
+    }
+
+    #[test]
+    fn eliding_leaves_text_only_content_alone() {
+        let content =
+            serde_json::to_string(&vec![MessageContentBlock::Text(TextContent::new("hello"))])
+                .unwrap();
+        assert!(elide_unseen_content(&content).is_none());
+    }
+
+    #[test]
+    fn eliding_reaches_an_image_nested_in_a_tool_response() {
+        let response = CallToolResult::success(vec![ContentBlock::Image(ImageContent::new(
+            "B".repeat(2048),
+            "image/png",
+        ))]);
+        let content =
+            serde_json::to_string(&vec![MessageContentBlock::ToolResponse(ToolResponse {
+                id: "call".to_string(),
+                tool_result: Ok(response),
+                metadata: None,
+            })])
+            .unwrap();
+
+        let elided = elide_unseen_content(&content).unwrap();
+
+        assert!(elided.contains("[image elided: image/png, 2 KiB of base64]"));
+        assert!(!elided.contains("BBBB"));
+    }
+
+    #[tokio::test]
+    async fn archiving_elides_images_and_reasoning_from_the_stored_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = manager
+            .create_session(
+                PathBuf::from("/tmp"),
+                "elide".to_string(),
+                SessionType::User,
+                crate::config::GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let heavy = Message::assistant()
+            .with_id("heavy")
+            .with_content(MessageContentBlock::Thinking(ThinkingContentBlock {
+                thinking: "r".repeat(4096),
+                signature: String::new(),
+            }))
+            .with_content(MessageContentBlock::image("C".repeat(4096), "image/jpeg"));
+        manager.add_message(&session.id, &heavy).await.unwrap();
+
+        let before = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        let event = CompactionEvent::new(
+            CompactionTrigger::Clear,
+            None,
+            &before,
+            &Conversation::empty(),
+            Some(10),
+            Some(0),
+        );
+        manager
+            .archive_conversation(&session.id, &event)
+            .await
+            .unwrap();
+
+        let stored = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        let text = stored.messages()[0].as_concat_text();
+        assert!(text.contains("[image elided: image/jpeg, 4 KiB of base64]"));
+        assert!(!text.contains("CCCC"));
+        assert!(!text.contains("rrrr"));
+        assert!(!stored.messages()[0].is_agent_visible());
+    }
+
+    #[tokio::test]
+    async fn a_message_the_agent_can_still_see_keeps_its_image() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = manager
+            .create_session(
+                PathBuf::from("/tmp"),
+                "keep".to_string(),
+                SessionType::User,
+                crate::config::GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        manager
+            .add_message(
+                &session.id,
+                &Message::assistant()
+                    .with_id("visible")
+                    .with_content(MessageContentBlock::image("D".repeat(4096), "image/jpeg")),
+            )
+            .await
+            .unwrap();
+
+        let stored = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+
+        assert!(stored.messages()[0].is_agent_visible());
+        assert!(matches!(
+            stored.messages()[0].content[0],
+            MessageContentBlock::Image(_)
+        ));
     }
 
     #[tokio::test]
