@@ -14,6 +14,7 @@ use tracing::warn;
 use crate::capabilities::{SessionPermissions, SESSION_MODIFICATION};
 use crate::context_mgmt::count_context_tokens;
 use crate::conversation::message::{Message, SystemNotificationType};
+use crate::conversation::token_usage::TokenCount;
 use crate::conversation::Conversation;
 use crate::session::extension_data::{ExtensionData, ExtensionState};
 use crate::session::Session;
@@ -27,7 +28,7 @@ pub const MIN_AGENT_VISIBLE_MESSAGES_TO_COMPACT: usize = 4;
 /// lands and would ask for the compaction again. A repeat is only carried out
 /// once the context has grown by what another summary costs, which is on the
 /// order of the size the last compaction left behind and never less than this.
-pub const MIN_CONTEXT_GROWTH_TO_COMPACT: i32 = 4_096;
+pub const MIN_CONTEXT_GROWTH_TO_COMPACT: TokenCount = 4_096;
 
 /// A note the model carries across a compaction adds to the context it just
 /// paid to shrink, so it is bounded rather than silently truncated.
@@ -60,7 +61,7 @@ pub struct SessionRequestState {
     /// context has grown by at least that much would summarize the conversation
     /// that compaction just produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_applied_context_tokens: Option<i32>,
+    pub last_applied_context_tokens: Option<TokenCount>,
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -110,7 +111,11 @@ impl SessionRequestState {
         self.denied_compaction = Some(request);
     }
 
-    pub fn mark_applied(&mut self, request: &CompactionRequest, retained_context_tokens: i32) {
+    pub fn mark_applied(
+        &mut self,
+        request: &CompactionRequest,
+        retained_context_tokens: TokenCount,
+    ) {
         self.pending_compaction = None;
         self.denied_compaction = None;
         self.applied_compaction_count = self.applied_compaction_count.saturating_add(1);
@@ -250,8 +255,8 @@ pub fn denied_notice(request: &CompactionRequest) -> Message {
 /// The user-facing notice for a compaction the model asked for and got.
 pub fn applied_notice(
     request: &CompactionRequest,
-    before_tokens: Option<i32>,
-    after_tokens: Option<i32>,
+    before_tokens: Option<TokenCount>,
+    after_tokens: Option<TokenCount>,
     archived: usize,
 ) -> Message {
     let tokens = match (before_tokens, after_tokens) {
@@ -382,7 +387,7 @@ mod tests {
         conversation
     }
 
-    async fn session_compacted_at(tokens: i32) -> (Session, tempfile::TempDir) {
+    async fn session_compacted_at(tokens: TokenCount) -> (Session, tempfile::TempDir) {
         let (mut session, temp_dir) = session(true).await;
         let mut state = SessionRequestState::read(&session);
         state.last_applied_context_tokens = Some(tokens);

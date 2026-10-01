@@ -149,7 +149,7 @@ impl SessionManagerClient {
         if auto_compaction_enabled {
             match (used, context_limit) {
                 (Some(used), Some(limit)) if limit > 0 => {
-                    let threshold_tokens = (limit as f64 * threshold) as i32;
+                    let threshold_tokens = (limit as f64 * threshold) as i64;
                     lines.push(format!(
                         "auto-compaction: at {:.0}% of the limit ({} tokens); {} tokens to go",
                         threshold * 100.0,

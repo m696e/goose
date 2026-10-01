@@ -27,7 +27,9 @@ use crate::providers::toolshim::{
 };
 use crate::session::Session;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
-use goose_providers::conversation::token_usage::{CostSource, ProviderStats, ProviderUsage, Usage};
+use goose_providers::conversation::token_usage::{
+    CostSource, ProviderStats, ProviderUsage, TokenCount, Usage,
+};
 use goose_providers::model::ModelConfig;
 use rmcp::model::{ErrorData, Tool};
 use tracing::warn;
@@ -773,7 +775,7 @@ impl Agent {
         session_id: &str,
         schedule_id: Option<String>,
         usage: &ProviderUsage,
-        post_compaction_context_tokens: Option<i32>,
+        post_compaction_context_tokens: Option<TokenCount>,
     ) -> Result<ProviderUsage> {
         let manager = self.config.session_manager.clone();
         let session = manager.get_session(session_id, false).await?;

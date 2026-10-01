@@ -1,7 +1,7 @@
 use crate::canonical::maybe_get_canonical_model;
 use crate::canonical::ThinkingMode;
 use crate::conversation::message::{Message, MessageContentBlock};
-use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
+use crate::conversation::token_usage::{CostSource, ProviderUsage, TokenCount, Usage};
 use crate::documents::{
     convert_document, document_media_type_is_supported, unsupported_document_text, DocumentFormat,
     ASSISTANT_ROLE_REASON, UNSUPPORTED_MEDIA_TYPE_REASON,
@@ -665,7 +665,7 @@ fn usage_from_anthropic_fields(usage: &Value) -> Usage {
         usage
             .get(key)
             .and_then(|v| v.as_u64())
-            .map(|v| v.min(i32::MAX as u64) as i32)
+            .map(|v| v as TokenCount)
     };
 
     Usage::from_cache_exclusive_input(

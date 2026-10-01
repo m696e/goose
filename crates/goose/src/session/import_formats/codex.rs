@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
-use goose_providers::conversation::token_usage::Usage;
+use goose_providers::conversation::token_usage::{TokenCount, Usage};
 use goose_providers::formats::openai_responses::{ResponseOutputItem, ResponsesApiResponse};
 
 pub fn convert(content: &str) -> Result<String> {
@@ -253,12 +253,12 @@ pub fn convert(content: &str) -> Result<String> {
         created_at,
         updated_at,
         usage: Usage::new(
-            (total_input > 0).then_some(total_input as i32),
-            (total_output > 0).then_some(total_output as i32),
+            (total_input > 0).then_some(total_input as TokenCount),
+            (total_output > 0).then_some(total_output as TokenCount),
             None,
         )
         .with_cache_tokens(
-            (total_cache_read > 0).then_some(total_cache_read as i32),
+            (total_cache_read > 0).then_some(total_cache_read as TokenCount),
             None,
         ),
         accumulated_cost: None,

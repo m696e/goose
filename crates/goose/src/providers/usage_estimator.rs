@@ -1,7 +1,7 @@
 use crate::conversation::message::Message;
 use crate::token_counter::create_token_counter;
 use anyhow::Result;
-use goose_providers::conversation::token_usage::ProviderUsage;
+use goose_providers::conversation::token_usage::{ProviderUsage, TokenCount};
 use rmcp::model::Tool;
 
 /// Ensures that ProviderUsage has token counts, estimating them if necessary.
@@ -23,7 +23,7 @@ pub async fn ensure_usage_tokens(
 
     if provider_usage.usage.input_tokens.is_none() {
         let input_count = token_counter.count_chat_tokens(system_prompt, request_messages, tools);
-        provider_usage.usage.input_tokens = Some(input_count as i32);
+        provider_usage.usage.input_tokens = Some(input_count as TokenCount);
     }
 
     if provider_usage.usage.output_tokens.is_none() {
@@ -34,7 +34,7 @@ pub async fn ensure_usage_tokens(
             .collect::<Vec<_>>()
             .join(" ");
         let output_count = token_counter.count_tokens(&response_text);
-        provider_usage.usage.output_tokens = Some(output_count as i32);
+        provider_usage.usage.output_tokens = Some(output_count as TokenCount);
     }
 
     if let (Some(input), Some(output)) = (

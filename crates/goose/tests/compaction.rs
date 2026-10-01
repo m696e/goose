@@ -173,9 +173,9 @@ impl Provider for MockCompactionProvider {
         let usage = ProviderUsage::new(
             "mock-model".to_string(),
             Usage::new(
-                Some(input_tokens),
-                Some(output_tokens),
-                Some(input_tokens + output_tokens),
+                Some(i64::from(input_tokens)),
+                Some(i64::from(output_tokens)),
+                Some(i64::from(input_tokens + output_tokens)),
             ),
         );
 
@@ -1209,7 +1209,7 @@ async fn test_auto_compaction_during_reply() -> Result<()> {
 
     // Track compaction and context size changes
     let mut compaction_occurred = false;
-    let mut input_tokens_after_compaction: Option<i32> = None;
+    let mut input_tokens_after_compaction: Option<i64> = None;
 
     while let Some(event_result) = reply_stream.next().await {
         match event_result {
@@ -1370,7 +1370,7 @@ async fn test_context_limit_recovery_compaction() -> Result<()> {
     // Track compaction and context size changes
     let mut compaction_occurred = false;
     let mut got_response = false;
-    let mut input_tokens_after_compaction: Option<i32> = None;
+    let mut input_tokens_after_compaction: Option<i64> = None;
 
     while let Some(event_result) = reply_stream.next().await {
         match event_result {
