@@ -853,7 +853,16 @@ pub fn boottime() -> Result<timeval, Error> {
 	    return Ok(bt);
     }
 
-    #[warn(unreachable_code)]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
     Err(Error::UnsupportedSystem)
 }
 
