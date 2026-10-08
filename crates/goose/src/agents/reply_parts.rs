@@ -401,6 +401,35 @@ pub(crate) async fn stream_response_from_provider(
     let toolshim_tools = toolshim_tools.to_owned();
     let provider = provider.clone();
 
+    // A provider that declares a ceiling cannot be asked to shrink a request it
+    // never sees: gateways that count encoded bytes either refuse it or, worse,
+    // accept it and never prefill it, leaving the turn stuck waiting for a first
+    // token that never comes. Refuse it here instead, before the bytes go out,
+    // and yield the error through the stream so both agent loops handle it with
+    // the size logic they already have (describe it, then evict the largest
+    // content). A provider that declares no limit is left alone.
+    if !provider.manages_own_context() {
+        if let Some(limit) = provider.max_request_bytes() {
+            let projected = crate::agents::request_size::projected_request_bytes(
+                &system_prompt,
+                messages_for_provider.messages(),
+                &tools,
+            );
+            if projected > limit {
+                debug!("REFUSING_OVERSIZED_REQUEST_LOCALLY");
+                let error = ProviderError::RequestTooLarge(format!(
+                    "this request would carry about {} and the provider accepts about {} per \
+                     request, so it was not sent",
+                    crate::agents::request_size::human_bytes(projected),
+                    crate::agents::request_size::human_bytes(limit),
+                ));
+                return Ok(Box::pin(try_stream! {
+                    yield Err(error)?;
+                }));
+            }
+        }
+    }
+
     // Capture errors during stream creation and return them as part of the stream
     // so they can be handled by the existing error handling logic in the agent
     let model_config =

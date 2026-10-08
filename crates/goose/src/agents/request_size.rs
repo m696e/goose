@@ -6,6 +6,8 @@
 //! only the model knows what the payload is for, so goose describes the largest
 //! contributors and lets the model decide what to drop or shrink.
 
+use rmcp::model::Tool;
+
 use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::Conversation;
 
@@ -37,6 +39,43 @@ const REPORTED_OFFENDER_BYTES: usize = 64 * 1024;
 /// multiple of the largest offender's size, so that a second refusal does not
 /// follow immediately.
 const EVICTION_HEADROOM: f64 = 1.5;
+
+/// Framing the serialized body adds on top of [`estimated_request_bytes`]: role
+/// keys, `tool_calls`/`tool_call_id` wrappers, the data-URL prefix on an image
+/// and the request envelope. Small relative to the content, and the estimate is
+/// only ever used to refuse a request before sending it, so it errs high.
+pub(super) const REQUEST_SIZE_MARGIN: f64 = 1.05;
+
+/// Bytes the provider request will carry, near enough to compare against a
+/// provider's declared ceiling: the encoded content of every message the agent
+/// will send, plus the system prompt and the tool schemas.
+///
+/// The wire body adds per-message framing on top of this, so callers scale by
+/// [`REQUEST_SIZE_MARGIN`] before comparing it to the provider's limit.
+pub(super) fn estimated_request_bytes(
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[Tool],
+) -> usize {
+    let tools_bytes = serde_json::to_vec(tools)
+        .map(|encoded| encoded.len())
+        .unwrap_or(0);
+    let messages_bytes: usize = messages
+        .iter()
+        .map(|message| content_bytes(&message.content))
+        .sum();
+    system_prompt.len() + messages_bytes + tools_bytes
+}
+
+/// The size to compare against a provider's declared limit: the estimate with
+/// the framing margin applied.
+pub(super) fn projected_request_bytes(
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[Tool],
+) -> usize {
+    (estimated_request_bytes(system_prompt, messages, tools) as f64 * REQUEST_SIZE_MARGIN) as usize
+}
 
 fn content_bytes(content: &[MessageContent]) -> usize {
     serde_json::to_vec(content)
@@ -371,5 +410,23 @@ mod tests {
         assert!(advisory.contains("Request body is too large"), "{advisory}");
         assert!(advisory.contains("an-oversized-file"), "{advisory}");
         assert!(!advisory.contains("context window"), "{advisory}");
+    }
+
+    #[test]
+    fn estimates_the_request_from_its_parts() {
+        let messages = vec![sized_text("body", 100 * 1024)];
+        let tools: Vec<Tool> = Vec::new();
+
+        let estimated = estimated_request_bytes("system prompt", &messages, &tools);
+        let projected = projected_request_bytes("system prompt", &messages, &tools);
+
+        assert!(
+            (100 * 1024..110 * 1024).contains(&estimated),
+            "the content dominates the estimate: {estimated}"
+        );
+        assert!(
+            estimated < projected && projected <= estimated * 2,
+            "the margin only adds framing: {estimated} -> {projected}"
+        );
     }
 }

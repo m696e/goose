@@ -11,7 +11,7 @@ use crate::http_status::read_json_response;
 use crate::images::ImageFormat;
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
-use crate::stream_util::{with_line_timeout, StreamTimeouts, TimeoutPhase};
+use crate::stream_util::{with_line_timeout, StreamTimeouts, TimeoutPhase, LARGE_REQUEST_BYTES};
 use anyhow::Error;
 use async_stream::try_stream;
 use futures::TryStreamExt;
@@ -35,22 +35,42 @@ use super::retry::ProviderRetry;
 /// the connection died, whereas a missing *first* line usually means the provider
 /// is still chewing on the prompt (prefill scales with context size), so that
 /// case says so instead of blaming the network.
+///
+/// `request_bytes` is the serialized size of the request body that was sent.
+/// A missing first line on a *large* request is reported as
+/// [`ProviderError::RequestTooLarge`] (non-retryable) rather than a retryable
+/// `NetworkError`, because resending the identical oversized body would loop
+/// forever; that maps to the agent loop's shrink-the-request handling. Small
+/// requests keep the retryable `NetworkError`, so genuine transient blips are
+/// still retried.
 pub(crate) fn stream_timeout_error(
     phase: TimeoutPhase,
     timeouts: &StreamTimeouts,
+    request_bytes: usize,
 ) -> ProviderError {
+    let first_line_budget_secs = timeouts
+        .first_line
+        .map(|budget| budget.as_secs())
+        .unwrap_or_default();
     match phase {
         TimeoutPhase::Idle => ProviderError::NetworkError(
             "Stream timed out waiting for next chunk — check your network connection".to_string(),
         ),
+        TimeoutPhase::FirstLine if request_bytes >= LARGE_REQUEST_BYTES => {
+            ProviderError::RequestTooLarge(format!(
+                "The provider sent no first line within {}s for a {} byte request — the request \
+                 is large enough that the provider is likely still receiving or prefilling it. \
+                 Lower this provider's `max_request_bytes`, or raise \
+                 `stream_first_line_timeout_secs` / GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS if \
+                 the large request is intended.",
+                first_line_budget_secs, request_bytes
+            ))
+        }
         TimeoutPhase::FirstLine => ProviderError::NetworkError(format!(
             "The provider sent no response within {}s — it may still be processing the prompt \
              (large context / slow prefill). Raise `stream_first_line_timeout_secs` for this \
              provider, or GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS, if that is expected.",
-            timeouts
-                .first_line
-                .map(|budget| budget.as_secs())
-                .unwrap_or_default()
+            first_line_budget_secs
         )),
     }
 }
@@ -161,7 +181,8 @@ impl OpenAiCompatibleProvider {
                 let _ = log.error(e);
             })?;
         if self.supports_streaming {
-            stream_openai_compat_with_timeouts(response, log, self.stream_timeouts)
+            let request_bytes = serde_json::to_vec(&payload).map(|b| b.len()).unwrap_or(0);
+            stream_openai_compat_with_timeouts(response, log, self.stream_timeouts, request_bytes)
         } else {
             let json = read_json_response(response).await?;
             let message = response_to_message(&json).map_err(|e| {
@@ -273,13 +294,14 @@ pub fn stream_openai_compat(
     response: Response,
     log: Option<Box<dyn RequestLogHandle>>,
 ) -> Result<MessageStream, ProviderError> {
-    stream_openai_compat_with_timeouts(response, log, StreamTimeouts::default())
+    stream_openai_compat_with_timeouts(response, log, StreamTimeouts::default(), 0)
 }
 
 pub fn stream_openai_compat_with_timeouts(
     response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
     timeouts: StreamTimeouts,
+    request_bytes: usize,
 ) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -298,7 +320,7 @@ pub fn stream_openai_compat_with_timeouts(
             framed,
             timeouts.chunk,
             timeouts.first_line,
-            move |phase| stream_timeout_error(phase, &timeouts).into(),
+            move |phase| stream_timeout_error(phase, &timeouts, request_bytes).into(),
         );
         let message_stream = response_to_streaming_message(timed_lines);
         pin!(message_stream);
@@ -317,13 +339,14 @@ pub fn stream_responses_compat(
     response: Response,
     log: Option<Box<dyn RequestLogHandle>>,
 ) -> Result<MessageStream, ProviderError> {
-    stream_responses_compat_with_timeouts(response, log, StreamTimeouts::default())
+    stream_responses_compat_with_timeouts(response, log, StreamTimeouts::default(), 0)
 }
 
 pub fn stream_responses_compat_with_timeouts(
     response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
     timeouts: StreamTimeouts,
+    request_bytes: usize,
 ) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -337,7 +360,7 @@ pub fn stream_responses_compat_with_timeouts(
             framed,
             timeouts.chunk,
             timeouts.first_line,
-            move |phase| stream_timeout_error(phase, &timeouts).into(),
+            move |phase| stream_timeout_error(phase, &timeouts, request_bytes).into(),
         );
         let message_stream = responses_api_to_streaming_message(timed_lines);
         pin!(message_stream);
@@ -427,6 +450,53 @@ mod tests {
             actual, expected_telemetry,
             "Expected {expected_variant}, got error: {err:?}"
         );
+    }
+
+    #[test]
+    fn first_line_timeout_on_large_request_is_request_too_large() {
+        let err = stream_timeout_error(
+            TimeoutPhase::FirstLine,
+            &StreamTimeouts::default(),
+            LARGE_REQUEST_BYTES,
+        );
+        match err {
+            ProviderError::RequestTooLarge(message) => {
+                assert!(message.contains("max_request_bytes"));
+                assert!(message.contains(&LARGE_REQUEST_BYTES.to_string()));
+            }
+            other => panic!("expected RequestTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_line_timeout_on_small_request_stays_network_error() {
+        let err = stream_timeout_error(
+            TimeoutPhase::FirstLine,
+            &StreamTimeouts::default(),
+            LARGE_REQUEST_BYTES - 1,
+        );
+        assert!(matches!(err, ProviderError::NetworkError(_)));
+    }
+
+    #[test]
+    fn legacy_zero_size_is_not_large() {
+        let err = stream_timeout_error(TimeoutPhase::FirstLine, &StreamTimeouts::default(), 0);
+        assert!(matches!(err, ProviderError::NetworkError(_)));
+    }
+
+    #[test]
+    fn idle_timeout_is_network_error_regardless_of_size() {
+        for request_bytes in [0, LARGE_REQUEST_BYTES, LARGE_REQUEST_BYTES * 2] {
+            let err = stream_timeout_error(
+                TimeoutPhase::Idle,
+                &StreamTimeouts::default(),
+                request_bytes,
+            );
+            assert!(
+                matches!(err, ProviderError::NetworkError(_)),
+                "idle timeout must stay a NetworkError for {request_bytes} bytes"
+            );
+        }
     }
 
     #[test]

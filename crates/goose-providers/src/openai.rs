@@ -350,7 +350,13 @@ impl OpenAiProvider {
                 let _ = log.error(e);
             })?;
         if self.supports_streaming {
-            stream_responses_compat_with_timeouts(response, log, self.stream_timeouts)
+            let request_bytes = serde_json::to_vec(&payload).map(|b| b.len()).unwrap_or(0);
+            stream_responses_compat_with_timeouts(
+                response,
+                log,
+                self.stream_timeouts,
+                request_bytes,
+            )
         } else {
             let json: serde_json::Value = read_json_response(response).await?;
             let parsed: ResponsesApiResponse =
@@ -876,7 +882,13 @@ impl Provider for OpenAiProvider {
                 })?;
 
             if self.supports_streaming {
-                stream_openai_compat_with_timeouts(response, log, self.stream_timeouts)
+                let request_bytes = serde_json::to_vec(&payload).map(|b| b.len()).unwrap_or(0);
+                stream_openai_compat_with_timeouts(
+                    response,
+                    log,
+                    self.stream_timeouts,
+                    request_bytes,
+                )
             } else {
                 let json: serde_json::Value = read_json_response(response).await?;
 

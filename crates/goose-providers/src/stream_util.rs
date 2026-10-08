@@ -24,6 +24,16 @@ pub const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 15;
 /// socket-level read timeout.
 pub const DEFAULT_FIRST_LINE_TIMEOUT_SECS: u64 = 120;
 
+/// Serialized request-body size above which a missing first line is treated as
+/// "the prefill is bound to be slow" rather than a transient network blip.
+///
+/// Measured against an OpenAI-compatible gateway that buffers the whole request
+/// before emitting its first SSE line: a 4 MB body produced no first line for
+/// 231 s, 488 KB took 77 s, and 178 KB took 18 s. Large bodies therefore exceed
+/// even the generous [`DEFAULT_FIRST_LINE_TIMEOUT_SECS`] budget while small ones
+/// finish in tens of seconds, so this boundary separates the two regimes.
+pub const LARGE_REQUEST_BYTES: usize = 256 * 1024;
+
 /// Which window elapsed when [`with_line_timeout`] gave up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutPhase {

@@ -267,7 +267,7 @@ impl AnthropicProvider {
                 framed,
                 stream_timeouts.chunk,
                 stream_timeouts.first_line,
-                move |phase| stream_timeout_error(phase, &stream_timeouts).into(),
+                move |phase| stream_timeout_error(phase, &stream_timeouts, 0).into(),
             );
             let messages = response_to_streaming_message(timed_lines);
             pin!(messages);
