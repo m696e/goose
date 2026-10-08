@@ -25,11 +25,9 @@ use crate::providers::toolshim::{
     augment_message_with_selected_tool_interpreter, convert_tool_messages_to_text,
     modify_system_prompt_for_tool_json, sanitize_residual_markers,
 };
-use crate::session::Session;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
-use goose_providers::conversation::token_usage::{
-    CostSource, ProviderStats, ProviderUsage, TokenCount, Usage,
-};
+use crate::session::Session;
+use goose_providers::conversation::token_usage::{ProviderStats, ProviderUsage, TokenCount, Usage};
 use goose_providers::model::ModelConfig;
 use rmcp::model::{ErrorData, Tool};
 use tracing::warn;
@@ -888,7 +886,7 @@ impl Agent {
                 ))
             }
             CompactionDecision::Apply => {
-                let provider = self.provider().await?;
+                let provider = self.provider(session_id).await?;
                 let before = conversation.clone();
                 let before_tokens = session.usage.total_tokens;
                 match crate::context_mgmt::compact_messages(
@@ -969,22 +967,6 @@ impl Agent {
         let notice = notice.with_generated_id_if_missing();
         session_manager.add_message(session_id, &notice).await?;
         Ok(notice)
-    }
-
-    fn resolve_chunk_cost(
-        &self,
-        usage: &ProviderUsage,
-        provider_name: Option<&str>,
-    ) -> (Option<f64>, Option<CostSource>) {
-        if let Some(cost) = usage.cost {
-            return (Some(cost), Some(CostSource::ProviderReported));
-        }
-        match provider_name.and_then(|pn| {
-            crate::providers::canonical_cost::estimate_model_cost(pn, &usage.model, &usage.usage)
-        }) {
-            Some(cost) => (Some(cost), Some(CostSource::Estimated)),
-            None => (None, None),
-        }
     }
 }
 

@@ -3010,6 +3010,7 @@ mod tests {
             )])),
             reasoning: Some(false),
             supports_vision: Some(true),
+            max_image_dimension: None,
             request_headers: None,
         };
 

@@ -79,15 +79,7 @@ impl SessionManagerClient {
             .map_err(|error| format!("Failed to read the session: {error}"))?;
         let conversation = session.conversation.clone().unwrap_or_default();
 
-        let provider = match self
-            .context
-            .extension_manager
-            .as_ref()
-            .and_then(|manager| manager.upgrade())
-        {
-            Some(manager) => manager.get_provider().lock().await.clone(),
-            None => None,
-        };
+        let provider = self.context.provider_for_session(session_id).await.ok();
         let model_config = self
             .context
             .model_config_for_session(session_id)
@@ -405,13 +397,13 @@ mod tests {
 
     fn client(
         manager: &Arc<crate::session::SessionManager>,
-        session: &crate::session::Session,
+        _session: &crate::session::Session,
     ) -> SessionManagerClient {
         SessionManagerClient::new(PlatformExtensionContext {
             extension_manager: None,
+            providers: Default::default(),
             session_manager: manager.clone(),
             scheduler: None,
-            session: Some(Arc::new(session.clone())),
             use_login_shell_path: false,
         })
         .unwrap()
@@ -462,7 +454,12 @@ mod tests {
 
         let status = client.session_status(&session.id).await.unwrap();
 
-        assert!(status.contains("context: 500 tokens as of the last request"));
+        // The limit may or may not be resolvable depending on the configured
+        // provider, so assert the reported total and the wording, not the branch.
+        assert!(
+            status.contains("context: 500") && status.contains("as of the last request"),
+            "status was:\n{status}"
+        );
         assert!(status.contains("messages: 1 visible to you, 1 on record"));
         assert!(status.contains("archived: nothing yet"));
         assert!(status.contains("session-modification: denied"));

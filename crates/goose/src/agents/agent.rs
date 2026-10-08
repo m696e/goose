@@ -36,9 +36,9 @@ use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::ops_recipe;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
-    persist_tool_confirmation_decision, run_goose, ArchiveOperation, CapabilityOperation,
-    subagent_cancelled_message, BangShellOperation, CompactionOperation, DoctorOperation,
-    Emitter, EntryHookOperation, ExitOnErrorOperation, ForegroundSubagentOperation, GooseEffect,
+    persist_tool_confirmation_decision, run_goose, subagent_cancelled_message, ArchiveOperation,
+    BangShellOperation, CapabilityOperation, CompactionOperation, DoctorOperation, Emitter,
+    EntryHookOperation, ExitOnErrorOperation, ForegroundSubagentOperation, GooseEffect,
     GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
     Operation, ProjectOperation, RecipeOperation, RequestSizeOperation, RetryOperation,
     SessionRequestOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
@@ -3317,7 +3317,7 @@ impl Agent {
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             request_size_attempts += 1;
 
-                            let limit = self.provider().await?.max_request_bytes();
+                            let limit = self.provider(&session_config.id).await?.max_request_bytes();
                             if request_size_attempts <= request_size::MAX_REQUEST_SIZE_ADVISORIES as u32 {
                                 retrying_after_oversized_request = true;
                                 let advisory = request_size::oversized_request_message(

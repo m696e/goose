@@ -14,9 +14,7 @@ use crate::agents::state_machine::{
     OperationResult, SlashCommand,
 };
 use crate::context_mgmt::{compact_messages, count_context_tokens};
-use crate::conversation::message::{
-    Message, MessageContent, MessageErrorKind, SystemNotificationType,
-};
+use crate::conversation::message::{Message, MessageErrorKind, SystemNotificationType};
 use crate::conversation::token_usage::TokenCount;
 use crate::conversation::{Conversation, EffectiveRole};
 use crate::providers::base::Provider;

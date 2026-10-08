@@ -9,8 +9,8 @@ use crate::capabilities::{
 use crate::context_mgmt::compact_messages;
 use crate::conversation::message::Message;
 use crate::recipe::Recipe;
-use crate::session::GoalState;
 use crate::session::compaction_event::{CompactionEvent, CompactionTrigger};
+use crate::session::GoalState;
 use crate::slash_commands::{recipe_slash_command, skill_slash_command};
 
 use super::final_output_tool::FinalOutputTool;

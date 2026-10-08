@@ -2,8 +2,8 @@ use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::providers::base::ProviderUsage;
 use crate::recipe::Recipe;
-use crate::session::ExtensionState;
 use crate::session::compaction_event::CompactionEvent;
+use crate::session::{ExtensionData, ExtensionState};
 use anyhow::Result;
 use goose_agent::operation::{ConversationEffect, MachineEffect};
 
@@ -22,6 +22,9 @@ pub enum GooseEffect {
     /// Record history that was taken away without replacing the conversation.
     RecordArchiveEvent(CompactionEvent),
     SetRecipe(Box<Option<Recipe>>),
+    /// Replace the session's whole extension-data blob. Used by the capabilities
+    /// and session-request paths, which own their own keys inside it.
+    SetExtensionData(ExtensionData),
     SetExtensionState {
         extension_name: &'static str,
         version: &'static str,

@@ -165,10 +165,8 @@ async fn stream_messages(
 #[tokio::test]
 async fn both_loops_execute_every_tool_from_the_last_allowed_reply() -> Result<()> {
     for use_state_machine in [false, true] {
-        let (agent, api, session_id, calculator, _temp_dir) = agent_with_calculator().await?;
-        agent
-            .update_goose_mode(GooseMode::Auto, &session_id)
-            .await?;
+        let (agent, api, session_id, calculator, _temp_dir) =
+            agent_with_calculator(GooseMode::Auto).await?;
         api.on("add twice")
             .calls([("first_add", ADD, value(1)), ("second_add", ADD, value(2))]);
 
@@ -630,7 +628,8 @@ async fn state_machine_rejects_resumed_skill_approval_without_its_lease() -> Res
 #[tokio::test]
 async fn state_machine_rejects_resumed_approval_without_its_lease() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
-    let (agent, api, session_id, calculator, _temp_dir) = agent_with_calculator().await?;
+    let (agent, api, session_id, calculator, _temp_dir) =
+        agent_with_calculator(GooseMode::Approve).await?;
     let agent = Arc::new(agent);
 
     api.on("add one").call(ADD, value(1));

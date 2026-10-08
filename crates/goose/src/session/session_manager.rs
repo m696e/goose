@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 21;
+pub const CURRENT_SCHEMA_VERSION: i32 = 22;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -2080,18 +2080,18 @@ impl SessionStorage {
                 .execute(&mut **tx)
                 .await?;
             }
-            18 => {
+            19 => {
                 Self::create_compaction_events_table(tx).await?;
             }
-            19 => {
+            20 => {
                 Self::add_compaction_event_carry_column(tx).await?;
             }
-            20 => {
-                // Databases that recorded a version 17 before this arm existed
-                // (this branch used 17 for its own migration before rebasing onto
+            21 => {
+                // Databases that recorded a version 18 before this arm existed
+                // (this branch used 18 for its own migration before rebasing onto
                 // the fix that introduced the index in that slot) have already
-                // been stamped past v17, so v17's CREATE INDEX never runs for
-                // them. Re-ensure the index under a fresh version so those
+                // been stamped past v18, so that arm's CREATE INDEX never runs
+                // for them. Re-ensure the index under a fresh version so those
                 // databases recover instead of holding the write lock for
                 // minutes on every large compaction.
                 sqlx::query(
@@ -2100,7 +2100,7 @@ impl SessionStorage {
                 .execute(&mut **tx)
                 .await?;
             }
-            21 => {
+            22 => {
                 Self::create_jev_decisions_table(tx).await?;
             }
             _ => {

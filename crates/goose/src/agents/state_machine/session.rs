@@ -117,6 +117,12 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
                         .apply()
                         .await?;
                 }
+                GooseEffect::SetExtensionData(extension_data) => {
+                    self.update(&session.id)
+                        .extension_data(extension_data.clone())
+                        .apply()
+                        .await?;
+                }
                 GooseEffect::SetExtensionState {
                     extension_name,
                     version,
