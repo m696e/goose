@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 22;
+pub const CURRENT_SCHEMA_VERSION: i32 = 23;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -2047,26 +2047,7 @@ impl SessionStorage {
                 .await?;
             }
             17 => {
-                for column in [
-                    "system_prompt_override",
-                    "system_prompt_extras_json",
-                    "container_id",
-                ] {
-                    let has_column = sqlx::query_scalar::<_, i32>(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?",
-                    )
-                    .bind(column)
-                    .fetch_one(&mut **tx)
-                    .await?
-                        > 0;
-                    if !has_column {
-                        sqlx::query(AssertSqlSafe(format!(
-                            "ALTER TABLE sessions ADD COLUMN {column} TEXT"
-                        )))
-                        .execute(&mut **tx)
-                        .await?;
-                    }
-                }
+                Self::ensure_session_prompt_columns(tx).await?;
             }
             18 => {
                 // Loading a single message within a session is what
@@ -2102,6 +2083,17 @@ impl SessionStorage {
             }
             22 => {
                 Self::create_jev_decisions_table(tx).await?;
+            }
+            23 => {
+                // Databases migrated by an earlier build of this branch reached
+                // version 17 while that slot meant something else (this fork's
+                // index migration), so upstream's arm 17 — which adds
+                // system_prompt_override, system_prompt_extras_json and
+                // container_id — never ran for them and is skipped forever once
+                // the version is stamped. Re-ensure the columns under a fresh
+                // version so those databases recover instead of failing every
+                // read with "no column found for name: system_prompt_override".
+                Self::ensure_session_prompt_columns(tx).await?;
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
@@ -2499,6 +2491,30 @@ impl SessionStorage {
             .await?;
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_session_prompt_columns(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+        for column in [
+            "system_prompt_override",
+            "system_prompt_extras_json",
+            "container_id",
+        ] {
+            let has_column = sqlx::query_scalar::<_, i32>(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?",
+            )
+            .bind(column)
+            .fetch_one(&mut **tx)
+            .await?
+                > 0;
+            if !has_column {
+                sqlx::query(AssertSqlSafe(format!(
+                    "ALTER TABLE sessions ADD COLUMN {column} TEXT"
+                )))
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -6155,6 +6171,69 @@ mod tests {
         .unwrap();
 
         assert_eq!(sm.list_jev_decisions(&id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_database_stamped_past_v17_gains_the_session_prompt_columns() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join(SESSIONS_FOLDER).join(DB_NAME);
+
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+
+        SessionStorage::create_schema(&pool).await.unwrap();
+
+        // Recreate the state an earlier build of this branch left behind: the
+        // database is stamped past v17, but v17 in that build meant the index
+        // migration, so upstream's column-add arm never ran and the three
+        // columns are absent. SQLite cannot DROP COLUMN with a dependency-free
+        // rebuild here, so emulate the missing columns directly.
+        sqlx::query("ALTER TABLE sessions DROP COLUMN system_prompt_override")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE sessions DROP COLUMN system_prompt_extras_json")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE sessions DROP COLUMN container_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 22")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        sm.storage().pool().await.unwrap(); // Triggers migration
+
+        let pool2 = sm.storage().pool().await.unwrap();
+        let ver: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(pool2)
+            .await
+            .unwrap();
+        let cols: i32 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('system_prompt_override','system_prompt_extras_json','container_id')",
+        )
+        .fetch_one(pool2)
+        .await
+        .unwrap();
+        assert_eq!(ver, CURRENT_SCHEMA_VERSION);
+        assert_eq!(cols, 3, "the re-ensure arm must restore all three columns");
+
+        let id = new_session(&sm).await;
+        let loaded = sm.get_session(&id, false).await.unwrap();
+        assert_eq!(loaded.id, id);
     }
 
     fn message_usage(input: i64, output: i64, cost: f64, is_compaction: bool) -> MessageUsage {
