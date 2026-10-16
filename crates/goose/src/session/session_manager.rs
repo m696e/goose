@@ -65,6 +65,35 @@ pub enum SessionType {
 static SESSION_STORAGE: LazyLock<Arc<SessionStorage>> =
     LazyLock::new(|| Arc::new(SessionStorage::new(Paths::data_dir())));
 
+/// How much of a session's archive a load should carry.
+///
+/// Compaction takes history away from the agent by turning `agentVisible` off
+/// rather than deleting the rows, so a long-lived session accumulates an
+/// archive that is almost all of its stored bytes — 94% of the text in a
+/// session compacted 124 times. Reading it back on every resume is what makes
+/// such a session cost more memory than a fresh one.
+///
+/// The rows are not what is expensive, the content is. So a load keeps every
+/// message and only leaves the archived text behind: roles, timestamps,
+/// visibility, ordering and metadata all survive, and the agent loop reads
+/// nothing else. That matters because the archive cannot be identified by
+/// `agentVisible` alone — goose also uses that flag for messages the loop keeps
+/// for itself and must never send (turn contexts, the retry counter that bounds
+/// reactive compaction, transcript notes), and dropping those changes
+/// behaviour. Each compaction event names the messages it took away, and that
+/// list is the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConversationScope {
+    /// Every message, with the content compaction archived left on disk. What
+    /// the session is still working with, and what every agent-facing load
+    /// wants.
+    #[default]
+    Working,
+    /// Every message verbatim, archived content included. For export, `--edit`,
+    /// `--fork`, `--history` and the tools that show the record.
+    Verbatim,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -651,8 +680,21 @@ impl SessionManager {
             .await
     }
 
+    /// Load a session and the conversation it is still working with
+    /// ([`ConversationScope::Working`]): every message, with the content
+    /// compaction archived left on disk.
     pub async fn get_session(&self, id: &str, include_messages: bool) -> Result<Session> {
-        self.storage.get_session(id, include_messages).await
+        self.storage
+            .get_session_scoped(id, include_messages.then_some(ConversationScope::Working))
+            .await
+    }
+
+    /// Load a session with archived content included, for anything that shows
+    /// the whole record rather than the current conversation.
+    pub async fn get_session_with_archive(&self, id: &str) -> Result<Session> {
+        self.storage
+            .get_session_scoped(id, Some(ConversationScope::Verbatim))
+            .await
     }
 
     pub fn update(&self, id: &str) -> SessionUpdateBuilder<'_> {
@@ -1034,6 +1076,17 @@ fn normalized_message_timestamp_sql(column: &str) -> String {
 fn user_visible_message_sql(column: &str) -> String {
     format!("COALESCE(json_extract({column}, '$.userVisible'), 1) != 0")
 }
+
+/// Names the messages compaction has taken away from the session, bound to the
+/// session id. Materialised once per statement rather than re-derived per row.
+const ARCHIVED_CTE: &str = "WITH archived AS (\
+    SELECT DISTINCT value FROM compaction_events, json_each(compaction_events.archived_message_ids) \
+    WHERE compaction_events.session_id = ? AND value IS NOT NULL)";
+
+/// `content_json` for a working load: an empty block list for anything a
+/// compaction archived, the stored text otherwise.
+const CONTENT_COLUMN_WORKING: &str =
+    "CASE WHEN message_id IN (SELECT value FROM archived) THEN '[]' ELSE content_json END";
 
 /// Replaces reasoning text when the message it belongs to is elided.
 const ELIDED_REASONING: &str = "[reasoning elided]";
@@ -2149,6 +2202,17 @@ impl SessionStorage {
     }
 
     async fn get_session(&self, id: &str, include_messages: bool) -> Result<Session> {
+        self.get_session_scoped(id, include_messages.then_some(ConversationScope::Working))
+            .await
+    }
+
+    /// Load a session. `scope` selects how much of the archive comes back with
+    /// it; the agent-facing [`ConversationScope::Working`] is the default.
+    async fn get_session_scoped(
+        &self,
+        id: &str,
+        scope: Option<ConversationScope>,
+    ) -> Result<Session> {
         let pool = self.pool().await?;
         let mut session = sqlx::query_as::<_, Session>(
             r#"
@@ -2171,8 +2235,11 @@ impl SessionStorage {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        if include_messages {
-            let conv = self.get_conversation(&session.id).await?;
+        // Every scope returns every message, so the count reads the same either
+        // way — and a caller that asked for the conversation has already paid
+        // for it, so counting it here costs no further query.
+        if let Some(scope) = scope {
+            let conv = self.get_conversation(&session.id, scope).await?;
             session.message_count = conv
                 .messages()
                 .iter()
@@ -2411,17 +2478,39 @@ impl SessionStorage {
         Ok(query.execute(pool).await?.rows_affected() == 1)
     }
 
-    async fn get_conversation(&self, session_id: &str) -> Result<Conversation> {
+    async fn get_conversation(
+        &self,
+        session_id: &str,
+        scope: ConversationScope,
+    ) -> Result<Conversation> {
         let pool = self.pool().await?;
-        let rows = sqlx::query_as::<_, (String, String, i64, Option<String>, Option<String>)>(
-            // Order by created_timestamp, then by id to break ties. created_timestamp is in seconds,
-            // so messages created in the same second (e.g., tool request and response) need to
-            // maintain their insertion order via the auto-increment id.
-            "SELECT role, content_json, created_timestamp, metadata_json, message_id FROM messages WHERE session_id = ? ORDER BY created_timestamp, id",
-        )
-            .bind(session_id)
-            .fetch_all(pool)
-            .await?;
+        // Order by created_timestamp, then by id to break ties. created_timestamp is in seconds,
+        // so messages created in the same second (e.g., tool request and response) need to
+        // maintain their insertion order via the auto-increment id.
+        //
+        // The Agent scope keeps the archived messages out of memory and out of
+        // the parse. It is the same predicate the request builder applies when
+        // it projects a conversation for the provider, so a scoped load cannot
+        // withhold anything the agent would otherwise have sent.
+        let (sql, binds) = match scope {
+            ConversationScope::Working => (
+                format!(
+                    "{ARCHIVED_CTE} SELECT role, {CONTENT_COLUMN_WORKING}, created_timestamp, metadata_json, message_id FROM messages WHERE session_id = ? ORDER BY created_timestamp, id"
+                ),
+                2,
+            ),
+            ConversationScope::Verbatim => (
+                "SELECT role, content_json, created_timestamp, metadata_json, message_id FROM messages WHERE session_id = ? ORDER BY created_timestamp, id".to_string(),
+                1,
+            ),
+        };
+        let mut query = sqlx::query_as::<_, (String, String, i64, Option<String>, Option<String>)>(
+            AssertSqlSafe(sql),
+        );
+        for _ in 0..binds {
+            query = query.bind(session_id);
+        }
+        let rows = query.fetch_all(pool).await?;
 
         let mut messages = Vec::new();
         for (role_str, content_json, created_timestamp, metadata_json, message_id) in
@@ -3365,7 +3454,9 @@ impl SessionStorage {
     }
 
     async fn export_session(&self, id: &str) -> Result<String> {
-        let session = self.get_session(id, true).await?;
+        let session = self
+            .get_session_scoped(id, Some(ConversationScope::Verbatim))
+            .await?;
         serde_json::to_string_pretty(&session).map_err(Into::into)
     }
 
@@ -3420,7 +3511,12 @@ impl SessionStorage {
         session_id: &str,
         new_name: String,
     ) -> Result<Session> {
-        let original_session = self.get_session(session_id, true).await?;
+        // A fork is a copy of the whole record: replace_conversation deletes
+        // and reinserts every row, so archiving scope here would drop the
+        // original's archived history from the copy.
+        let original_session = self
+            .get_session_scoped(session_id, Some(ConversationScope::Verbatim))
+            .await?;
 
         let new_session = self
             .create_session(
@@ -3763,22 +3859,162 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = manager
+        // A working load keeps the message, because the loop still counts it and
+        // orders by it, but not its text: that is the archive, and it is 94% of a
+        // long session's bytes.
+        let working = manager
             .get_session(&session.id, true)
             .await
             .unwrap()
             .conversation
             .unwrap();
-        assert_eq!(stored.messages().len(), 1);
-        assert_eq!(stored.messages()[0].as_concat_text(), "hello");
-        assert!(!stored.messages()[0].is_agent_visible());
-        assert!(stored.messages()[0].is_user_visible());
+        assert_eq!(working.messages().len(), 1, "the message stays on record");
+        assert_eq!(working.messages()[0].as_concat_text(), "");
+        assert!(!working.messages()[0].is_agent_visible());
+        assert!(working.messages()[0].is_user_visible());
+
+        let archived = manager
+            .get_session_with_archive(&session.id)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(archived.messages().len(), 1);
+        assert_eq!(archived.messages()[0].as_concat_text(), "hello");
+        assert!(!archived.messages()[0].is_agent_visible());
+        assert!(archived.messages()[0].is_user_visible());
+
+        // The count is a property of the session, not of the scope that was
+        // asked for, so it still reports the message that is on disk.
+        assert_eq!(
+            manager
+                .get_session(&session.id, true)
+                .await
+                .unwrap()
+                .message_count,
+            1
+        );
+        assert_eq!(
+            manager
+                .get_session_with_archive(&session.id)
+                .await
+                .unwrap()
+                .message_count,
+            1
+        );
 
         let events = manager.list_compaction_events(&session.id).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.trigger, CompactionTrigger::Clear);
         assert_eq!(events[0].event.archived_message_ids, vec!["keep"]);
         assert!(archive_summary(&events).unwrap().contains("1 message(s)"));
+    }
+
+    #[tokio::test]
+    async fn a_working_load_keeps_archived_messages_but_leaves_their_text_behind() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_with_one_message(&manager).await;
+
+        manager
+            .add_message(
+                &session.id,
+                &Message::assistant().with_id("a1").with_text("first reply"),
+            )
+            .await
+            .unwrap();
+
+        let before = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(before.messages().len(), 2);
+        let event = CompactionEvent::new(
+            CompactionTrigger::Threshold,
+            None,
+            &before,
+            &Conversation::empty(),
+            Some(90),
+            Some(0),
+        );
+        manager
+            .archive_conversation(&session.id, &event)
+            .await
+            .unwrap();
+
+        // A message added after the compaction is live again.
+        manager
+            .add_message(
+                &session.id,
+                &Message::user().with_id("a2").with_text("second question"),
+            )
+            .await
+            .unwrap();
+
+        let working = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(
+            working
+                .messages()
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>(),
+            vec!["", "", "second question"],
+            "the archived messages keep their place but not their text"
+        );
+
+        let all = manager
+            .get_session_with_archive(&session.id)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(all.messages().len(), 3);
+        assert_eq!(all.messages()[0].as_concat_text(), "hello");
+    }
+
+    /// The scope is the archive, not the visibility flag. goose hides messages
+    /// from the provider for reasons that have nothing to do with compaction —
+    /// turn contexts, the retry counter that bounds reactive compaction, the
+    /// transcript notes live voice leaves behind — and the agent loop reads those
+    /// back. Dropping them is not a memory saving, it is a behaviour change.
+    #[tokio::test]
+    async fn a_message_hidden_from_the_provider_but_not_archived_still_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_with_one_message(&manager).await;
+
+        manager
+            .add_message(
+                &session.id,
+                &Message::assistant()
+                    .with_id("marker")
+                    .with_text("kept for the loop, never sent")
+                    .with_visibility(true, false),
+            )
+            .await
+            .unwrap();
+
+        let live = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(
+            live.messages()
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>(),
+            vec!["hello", "kept for the loop, never sent"],
+            "an unarchived message stays in the conversation even when the provider cannot see it"
+        );
     }
 
     #[test]
@@ -3886,7 +4122,7 @@ mod tests {
             .unwrap();
 
         let stored = manager
-            .get_session(&session.id, true)
+            .get_session_with_archive(&session.id)
             .await
             .unwrap()
             .conversation
@@ -3994,7 +4230,7 @@ mod tests {
             .unwrap();
 
         let stored = manager
-            .get_session(&session.id, true)
+            .get_session_with_archive(&session.id)
             .await
             .unwrap()
             .conversation
@@ -4002,6 +4238,19 @@ mod tests {
         assert_eq!(stored.messages().len(), 2);
         assert!(!stored.messages()[0].is_agent_visible());
         assert!(stored.messages()[1].is_agent_visible());
+
+        // What the agent continues from is the summary; the summarized message
+        // keeps its place so the conversation still reads in order, but its
+        // text stays in the archive.
+        let working = manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert_eq!(working.messages().len(), 2);
+        assert_eq!(working.messages()[0].as_concat_text(), "");
+        assert_eq!(working.messages()[1].as_concat_text(), "summary");
 
         let events = manager.list_compaction_events(&session.id).await.unwrap();
         assert_eq!(events.len(), 1);

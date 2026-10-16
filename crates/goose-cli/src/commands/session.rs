@@ -514,7 +514,8 @@ pub async fn handle_session_export(
     format: String,
 ) -> Result<()> {
     let session_manager = SessionManager::instance();
-    let session = match session_manager.get_session(&session_id, true).await {
+    // Export writes the whole record, archived content included.
+    let session = match session_manager.get_session_with_archive(&session_id).await {
         Ok(session) => session,
         Err(e) => {
             return Err(anyhow::anyhow!(

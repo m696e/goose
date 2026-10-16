@@ -1868,11 +1868,24 @@ impl CliSession {
         self.messages.clone()
     }
 
-    /// Render all past messages from the session history
-    pub fn render_message_history(&self) {
-        let messages = self.messages.user_visible_messages();
+    /// Render all past messages from the session history.
+    ///
+    /// The session's own conversation carries archived messages by identity
+    /// rather than by text, so this reads the whole record on demand:
+    /// `--history` is the one path that is about everything ever said rather
+    /// than about resuming the current turn.
+    pub async fn render_message_history(&self) -> Result<()> {
+        let messages = self
+            .agent
+            .config
+            .session_manager
+            .get_session_with_archive(&self.session_id)
+            .await?
+            .conversation
+            .unwrap_or_default()
+            .user_visible_messages();
         if messages.is_empty() {
-            return;
+            return Ok(());
         }
 
         println!(
@@ -1887,6 +1900,7 @@ impl CliSession {
         }
 
         println!();
+        Ok(())
     }
 
     pub async fn get_session(&self) -> Result<goose::session::Session> {

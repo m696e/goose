@@ -137,8 +137,15 @@ impl ChatRecallClient {
             .map(|s| s.to_string());
 
         if let Some(sid) = target_session_id {
-            // LOAD MODE: Get session summary (first and last few messages)
-            match self.context.session_manager.get_session(&sid, true).await {
+            // LOAD MODE: Get session summary (first and last few messages).
+            // The excerpt quotes the messages themselves, so it needs the
+            // archived content the working load leaves behind.
+            match self
+                .context
+                .session_manager
+                .get_session_with_archive(&sid)
+                .await
+            {
                 Ok(loaded_session) => {
                     let conversation = loaded_session.conversation.as_ref();
 

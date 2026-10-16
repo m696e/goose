@@ -2114,7 +2114,10 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
     if edit || fork {
         if let Some(ref id) = session_id {
             let session_manager = SessionManager::instance();
-            let original = session_manager.get_session(id, true).await?;
+            // --edit rewrites the conversation with replace_conversation, which
+            // deletes and reinserts every row, so it must see the archived
+            // content too or editing a compacted session would discard it.
+            let original = session_manager.get_session_with_archive(id).await?;
 
             let target_id = if fork {
                 let copied = session_manager
@@ -2165,7 +2168,7 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
     .await;
 
     if (resume || fork) && history {
-        session.render_message_history();
+        session.render_message_history().await?;
     }
 
     let result = session.interactive(None).await;

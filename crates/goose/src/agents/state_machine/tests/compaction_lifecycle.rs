@@ -51,8 +51,17 @@ async fn proactive_and_manual_compaction_continue_with_replaced_usage() -> Resul
     assert_eq!(first_manual.history_replacements(), 1);
     assert_eq!(second_manual.history_replacements(), 1);
 
-    let commands = second_manual
-        .conversation()
+    // Both manual compactions are on record as user-visible, agent-invisible
+    // messages. A compaction archives the text of what it summarized, and a
+    // working load carries archived messages by identity rather than by text,
+    // so the record is read back the way a person reads it: from the archive.
+    let stored = pipeline
+        .session_manager
+        .get_session_with_archive(&pipeline.session_id)
+        .await?
+        .conversation
+        .unwrap();
+    let commands = stored
         .messages()
         .iter()
         .filter(|message| message.as_concat_text().trim() == "/compact")

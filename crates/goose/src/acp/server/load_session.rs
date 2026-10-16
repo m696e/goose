@@ -388,9 +388,12 @@ impl GooseAcpAgent {
 
         let session_id_str = args.session_id.0.to_string();
 
+        // The whole conversation is replayed to the client below, so this load
+        // wants the record rather than the working view: a compaction archives
+        // the text of what it summarized, and the UI still shows it.
         let mut session = self
             .session_manager
-            .get_session(&session_id_str, true)
+            .get_session_with_archive(&session_id_str)
             .await
             .map_err(|_| {
                 agent_client_protocol::Error::resource_not_found(Some(session_id_str.clone()))
