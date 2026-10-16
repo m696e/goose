@@ -893,17 +893,24 @@ impl Agent {
         session: &Session,
         unfixed_conversation: Conversation,
     ) -> Result<ReplyContext> {
-        let unfixed_messages = unfixed_conversation.messages().clone();
-        let (conversation, issues) = fix_conversation(unfixed_conversation.clone());
+        // The pre-fix conversation has exactly one reader below: the debug dump
+        // of a repair. It is a full copy of the session, so take it only when
+        // debug logging is on, and hand the conversation itself to
+        // `fix_conversation` rather than a copy of it.
+        let unfixed_messages = tracing::enabled!(tracing::Level::DEBUG)
+            .then(|| unfixed_conversation.messages().clone());
+        let (conversation, issues) = fix_conversation(unfixed_conversation);
         if !issues.is_empty() {
-            debug!(
-                "Conversation issue fixed: {}",
-                debug_conversation_fix(
-                    unfixed_messages.as_slice(),
-                    conversation.messages(),
-                    &issues
-                )
-            );
+            if let Some(unfixed_messages) = unfixed_messages {
+                debug!(
+                    "Conversation issue fixed: {}",
+                    debug_conversation_fix(
+                        unfixed_messages.as_slice(),
+                        conversation.messages(),
+                        &issues
+                    )
+                );
+            }
         }
         let (session, lease, tools, toolshim_tools, system_prompt, model_config) =
             self.prepare_tools_and_prompt(session).await?;
@@ -2241,21 +2248,27 @@ impl Agent {
 
         let message_text = message_text_for_trace;
 
-        let session = session_manager
-            .get_session(&session_config.id, true)
-            .await?;
-        tracing::Span::current()
-            .record("gen_ai.agent.name", gen_ai_telemetry::agent_name(&session));
-        let is_first_agent_turn = session
-            .conversation
-            .as_ref()
-            .map(|conversation| {
-                conversation.messages().iter().all(|message| {
-                    !message.is_agent_visible()
-                        || message.agent_visible_content().content.is_empty()
+        // This load exists only for the span name and the first-turn check. It
+        // is a full session, and a second one is loaded once commands have run,
+        // so scope it: holding it across the rest of the turn would keep a
+        // whole extra conversation resident.
+        let is_first_agent_turn = {
+            let session = session_manager
+                .get_session(&session_config.id, true)
+                .await?;
+            tracing::Span::current()
+                .record("gen_ai.agent.name", gen_ai_telemetry::agent_name(&session));
+            session
+                .conversation
+                .as_ref()
+                .map(|conversation| {
+                    conversation.messages().iter().all(|message| {
+                        !message.is_agent_visible()
+                            || message.agent_visible_content().content.is_empty()
+                    })
                 })
-            })
-            .unwrap_or(true);
+                .unwrap_or(true)
+        };
 
         if !user_message.is_agent_visible()
             || user_message.agent_visible_content().content.is_empty()
@@ -2399,12 +2412,16 @@ impl Agent {
                     .await?;
             }
         }
-        let session = session_manager
+        let mut session = session_manager
             .get_session(&session_config.id, true)
             .await?;
+        // Move the conversation out instead of copying it. There is no later
+        // reader of `session.conversation`, and the reply stream below holds
+        // both the session and the conversation for the whole turn, so a copy
+        // here doubles the session's resident footprint for no gain.
         let conversation = session
             .conversation
-            .clone()
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
 
         let final_output_tool = ops_recipe::final_output_tool(&session)?;
@@ -2442,7 +2459,6 @@ impl Agent {
         )
         .await?;
 
-        let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
         reply_span.record("gen_ai.agent.name", gen_ai_telemetry::agent_name(&session));
 
@@ -2454,6 +2470,10 @@ impl Agent {
             let final_conversation = if !needs_auto_compact {
                 conversation
             } else {
+                // Only the compacting branch needs the pre-compaction copy;
+                // taking it eagerly would hold a second full conversation for
+                // every ordinary turn.
+                let conversation_to_compact = conversation.clone();
                 let config = Config::global();
                 let threshold = config
                     .get_param::<f64>("GOOSE_AUTO_COMPACT_THRESHOLD")
