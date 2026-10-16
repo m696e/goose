@@ -34,7 +34,30 @@ async fn run() -> Result<()> {
     result
 }
 
+/// glibc keeps a separate malloc arena per allocating thread (up to 8 per
+/// core) and never returns a partly used arena to the OS. A long-lived,
+/// multi-threaded process therefore ends up holding a mostly empty arena per
+/// worker thread, which on a large session is tens of MiB of resident memory
+/// that no session-sized data accounts for. Cap the arenas unless the
+/// environment already asks for something else.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // Two arenas keep the runtime threads from serialising on the arena lock
+    // without letting each of them grow its own.
+    // SAFETY: mallopt only adjusts allocator tunables and this runs before any
+    // other thread exists.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn cap_malloc_arenas() {}
+
 fn main() -> Result<()> {
+    cap_malloc_arenas();
+
     #[cfg(windows)]
     enable_windows_vt_processing();
 
