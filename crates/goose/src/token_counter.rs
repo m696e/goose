@@ -20,8 +20,42 @@ const ENUM_ITEM: usize = 3;
 const FUNC_END: usize = 12;
 
 pub struct TokenCounter {
-    tokenizer: Arc<CoreBPE>,
+    counter: Counter,
     token_cache: Mutex<LruCache<TokenCacheKey, usize>>,
+}
+
+/// How tokens are counted.
+///
+/// The BPE tokenizer is the exact count, but `o200k_base` costs tens of MiB
+/// resident for the whole life of the process — its 200k-entry vocabulary is
+/// held as two hash maps of owned byte strings. Every count this crate
+/// produces feeds an estimate rather than a billing figure, so a session that
+/// would rather have the memory back can ask for the cheap stand-in with
+/// `GOOSE_TOKEN_COUNTER=approx`.
+enum Counter {
+    Exact(Arc<CoreBPE>),
+    Approx,
+}
+
+/// Four bytes per token. Measured against `o200k_base` over the agent-visible
+/// messages of three real sessions it lands within about ±20% — low on mixed
+/// technical tool output, high on repetitive prose — which is well inside the
+/// tolerance of the compaction threshold, and the provider's own usage figure
+/// wins whenever a session has one.
+fn approx_token_count(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+fn approx_requested() -> bool {
+    crate::config::Config::global()
+        .get_param::<String>("GOOSE_TOKEN_COUNTER")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "approx" | "approximate" | "estimate"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -41,11 +75,15 @@ impl TokenCacheKey {
 
 impl TokenCounter {
     pub async fn new() -> Result<Self, String> {
-        let tokenizer = get_tokenizer().await?;
+        let counter = if approx_requested() {
+            Counter::Approx
+        } else {
+            Counter::Exact(get_tokenizer().await?)
+        };
         let cache_capacity =
             NonZeroUsize::new(MAX_TOKEN_CACHE_SIZE).expect("token cache capacity must be non-zero");
         Ok(Self {
-            tokenizer,
+            counter,
             token_cache: Mutex::new(LruCache::new(cache_capacity)),
         })
     }
@@ -62,8 +100,10 @@ impl TokenCounter {
             return count;
         }
 
-        let tokens = self.tokenizer.encode_with_special_tokens(text);
-        let count = tokens.len();
+        let count = match &self.counter {
+            Counter::Exact(tokenizer) => tokenizer.encode_with_special_tokens(text).len(),
+            Counter::Approx => approx_token_count(text),
+        };
 
         self.token_cache
             .lock()
@@ -219,6 +259,28 @@ pub async fn create_token_counter() -> Result<TokenCounter, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approx_count_is_four_bytes_per_token() {
+        assert_eq!(approx_token_count(""), 0);
+        assert_eq!(approx_token_count("abc"), 1);
+        assert_eq!(approx_token_count("abcd"), 1);
+        assert_eq!(approx_token_count("abcde"), 2);
+        assert_eq!(approx_token_count(&"a".repeat(4000)), 1000);
+    }
+
+    #[tokio::test]
+    async fn approx_mode_counts_without_the_tokenizer() {
+        let approx = TokenCounter {
+            counter: Counter::Approx,
+            token_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_TOKEN_CACHE_SIZE).unwrap(),
+            )),
+        };
+        assert_eq!(approx.count_tokens("hello world"), 3);
+        assert_eq!(approx.count_tokens("hello world"), 3);
+        assert_eq!(approx.cache_size(), 1);
+    }
 
     #[tokio::test]
     async fn test_token_caching() {
