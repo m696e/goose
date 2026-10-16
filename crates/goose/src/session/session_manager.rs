@@ -1088,6 +1088,32 @@ const ARCHIVED_CTE: &str = "WITH archived AS (\
 const CONTENT_COLUMN_WORKING: &str =
     "CASE WHEN message_id IN (SELECT value FROM archived) THEN '[]' ELSE content_json END";
 
+/// What a working load drops: the rows a compaction archived, except the user
+/// side of the transcript.
+///
+/// An archived row is one compaction took away from the agent, and they are the
+/// bulk of a long session — 35,987 of 38,896 rows on one measured here. Replies
+/// and tool traffic are dropped outright: the agent filters them out of every
+/// request it builds, and a working load has already replaced their text with
+/// `'[]'`, so nothing that reads the loaded conversation can tell they are gone.
+///
+/// The user rows stay, for two consumers that find their way by role rather
+/// than by identity: `messages_since_kickoff` (`goose-agent`) takes the tail
+/// from the last `role == User && is_user_visible && !is_tool_response` row, and
+/// the SessionStart detection in `ops_entry_hook` asks whether any earlier
+/// user-visible user message exists. Both survive a compaction — archiving
+/// clears `agent_visible` and leaves `user_visible` alone — and a kickoff that
+/// has been archived still has to be found. The hidden handoff, an `agent_only`
+/// user message, is carried by the same rule; `state_machine::session` is tested
+/// for preserving it across a live replacement.
+///
+/// The cut is role, not the absence of a tool result, because content is already
+/// elided here: an archived tool result loads as `'[]'`, so `is_tool_response()`
+/// is false for it either way. Filtering on it would change behaviour rather
+/// than preserve it, and it costs a JSON pass over every archived row.
+const WORKING_ROW_FILTER: &str =
+    "AND (message_id NOT IN (SELECT value FROM archived) OR role = 'user')";
+
 /// Replaces reasoning text when the message it belongs to is elided.
 const ELIDED_REASONING: &str = "[reasoning elided]";
 
@@ -2495,7 +2521,7 @@ impl SessionStorage {
         let (sql, binds) = match scope {
             ConversationScope::Working => (
                 format!(
-                    "{ARCHIVED_CTE} SELECT role, {CONTENT_COLUMN_WORKING}, created_timestamp, metadata_json, message_id FROM messages WHERE session_id = ? ORDER BY created_timestamp, id"
+                    "{ARCHIVED_CTE} SELECT role, {CONTENT_COLUMN_WORKING}, created_timestamp, metadata_json, message_id FROM messages WHERE session_id = ? {WORKING_ROW_FILTER} ORDER BY created_timestamp, id"
                 ),
                 2,
             ),
@@ -3911,7 +3937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_working_load_keeps_archived_messages_but_leaves_their_text_behind() {
+    async fn a_working_load_drops_the_archived_replies_and_keeps_the_user_rows() {
         let temp_dir = TempDir::new().unwrap();
         let manager = SessionManager::new(temp_dir.path().to_path_buf());
         let session = session_with_one_message(&manager).await;
@@ -3923,6 +3949,24 @@ mod tests {
             )
             .await
             .unwrap();
+        // A tool result is a user-role message too, and most of an archive is
+        // made of them. Its content is elided on a working load either way, so
+        // the row stays but cannot be told apart from a prompt.
+        manager
+            .add_message(
+                &session.id,
+                &Message::user()
+                    .with_id("t1")
+                    .with_content(MessageContentBlock::ToolResponse(ToolResponse {
+                        id: "call".to_string(),
+                        tool_result: Ok(CallToolResult::success(vec![ContentBlock::Text(
+                            TextContent::new("tool output"),
+                        )])),
+                        metadata: None,
+                    })),
+            )
+            .await
+            .unwrap();
 
         let before = manager
             .get_session(&session.id, true)
@@ -3930,7 +3974,7 @@ mod tests {
             .unwrap()
             .conversation
             .unwrap();
-        assert_eq!(before.messages().len(), 2);
+        assert_eq!(before.messages().len(), 3);
         let event = CompactionEvent::new(
             CompactionTrigger::Threshold,
             None,
@@ -3966,7 +4010,8 @@ mod tests {
                 .map(Message::as_concat_text)
                 .collect::<Vec<_>>(),
             vec!["", "", "second question"],
-            "the archived messages keep their place but not their text"
+            "the archived user rows keep their place but not their text; the \
+             archived reply is gone"
         );
 
         let all = manager
@@ -3975,7 +4020,7 @@ mod tests {
             .unwrap()
             .conversation
             .unwrap();
-        assert_eq!(all.messages().len(), 3);
+        assert_eq!(all.messages().len(), 4);
         assert_eq!(all.messages()[0].as_concat_text(), "hello");
     }
 
