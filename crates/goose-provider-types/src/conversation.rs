@@ -232,8 +232,11 @@ impl<'a> IntoIterator for &'a Conversation {
 
 /// Fix a conversation that we're about to send to an LLM. So the first and last
 /// messages should always be from the user.
-pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String>) {
-    let all_messages = conversation.messages();
+pub fn fix_conversation(mut conversation: Conversation) -> (Conversation, Vec<String>) {
+    // This runs over the whole session on every turn, so the messages are moved
+    // through it rather than cloned: a clone here is a second copy of every
+    // message in the session.
+    let all_messages = std::mem::take(conversation.messages_mut());
 
     // Create a shadow map: track each message as either Visible or NonVisible with its index
     enum MessageSlot {
@@ -243,14 +246,14 @@ pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String
 
     let mut agent_visible_messages = Vec::new();
     let shadow_map: Vec<MessageSlot> = all_messages
-        .iter()
+        .into_iter()
         .map(|msg| {
             if msg.metadata.agent_visible {
                 let idx = agent_visible_messages.len();
-                agent_visible_messages.push(msg.clone());
+                agent_visible_messages.push(msg);
                 MessageSlot::Visible(idx)
             } else {
-                MessageSlot::NonVisible(msg.clone())
+                MessageSlot::NonVisible(msg)
             }
         })
         .collect();
@@ -258,11 +261,15 @@ pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String
     // Fix only the agent-visible messages
     let (fixed_visible, issues) = fix_messages(agent_visible_messages);
 
-    // Reconstruct using shadow map: replace Visible slots with fixed messages
+    // Reconstruct using shadow map: replace Visible slots with fixed messages.
+    // A repair can drop or merge messages, so a slot still resolves by index
+    // rather than by position in the fixed set; each index is claimed once, so
+    // taking the message leaves the same result as copying it did.
+    let mut fixed_visible: Vec<Option<Message>> = fixed_visible.into_iter().map(Some).collect();
     let final_messages: Vec<Message> = shadow_map
         .into_iter()
         .filter_map(|slot| match slot {
-            MessageSlot::Visible(idx) => fixed_visible.get(idx).cloned(),
+            MessageSlot::Visible(idx) => fixed_visible.get_mut(idx).and_then(Option::take),
             MessageSlot::NonVisible(msg) => Some(msg),
         })
         .collect();
