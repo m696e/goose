@@ -699,6 +699,10 @@ fn render_tool_response(resp: &ToolResponse, debug: bool) {
 
                 if debug {
                     println!("{:#?}", content);
+                } else if let rmcp::model::ContentBlock::Image(image) = content {
+                    // An image has no text a terminal can print, so it is drawn
+                    // with a graphics protocol instead of being skipped.
+                    crate::session::image_view::print_inline(image);
                 } else if let Some(text) = content.as_text() {
                     print_tool_output(&text.text);
                 }

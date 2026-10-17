@@ -2,6 +2,7 @@ mod builder;
 mod completion;
 pub mod editor;
 mod elicitation;
+mod image_view;
 mod input;
 mod output;
 mod paste;
