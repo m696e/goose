@@ -397,7 +397,7 @@ pub fn render_message(message: &Message, debug: bool) {
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, debug),
             MessageContent::Image(image) => {
-                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                crate::session::image_view::print_message_image(image);
             }
             MessageContent::Thinking(t) => render_thinking(&t.thinking, theme),
             MessageContent::RedactedThinking(_) => {
@@ -491,7 +491,7 @@ pub fn render_message_streaming(
             }
             MessageContent::Image(image) => {
                 flush_markdown_buffer(buffer, theme);
-                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                crate::session::image_view::print_message_image(image);
             }
             MessageContent::Thinking(t) => {
                 render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);

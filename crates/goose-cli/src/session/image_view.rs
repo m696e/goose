@@ -150,27 +150,61 @@ fn chafa(bytes: &[u8], protocol: Protocol, size: &str, binary: &str) -> Result<S
     Ok(art)
 }
 
-/// Draw `image` where the current tool output is being printed, if this
-/// terminal can show it.
+/// Draw `image` where output is currently being written.
 ///
 /// The renderer is run only for an interactive terminal: a pipe or a file gets
 /// the escape bytes as garbage, and `--output-format json` must stay parseable.
-pub fn print_inline(image: &ImageContent) {
+/// Returns whether anything was drawn, so a caller can say something else when
+/// the terminal cannot show it.
+pub fn draw(image: &ImageContent) -> bool {
     if !std::io::stdout().is_terminal() {
-        return;
+        return false;
     }
     let Some(protocol) = protocol() else {
-        return;
+        return false;
     };
     let size = setting("GOOSE_CLI_IMAGE_SIZE", DEFAULT_SIZE);
     let binary = setting("GOOSE_CLI_IMAGE_BIN", DEFAULT_BINARY);
-    if let Some(art) = art_for(image, protocol, &size, &binary) {
-        // The escape sequence is written verbatim: the tool-output printer
-        // strips control characters, which would leave the image as noise.
-        println!();
-        print!("{art}");
-        let _ = std::io::stdout().flush();
+    match art_for(image, protocol, &size, &binary) {
+        Some(art) => {
+            // The escape sequence is written verbatim: the tool-output printer
+            // strips control characters, which would leave the image as noise.
+            println!();
+            print!("{art}");
+            let _ = std::io::stdout().flush();
+            true
+        }
+        None => false,
     }
+}
+
+/// Draw the image in a tool result.
+///
+/// The result's own summary line already says what the image is, so nothing is
+/// printed when the terminal cannot show it.
+pub fn print_inline(image: &ImageContent) {
+    draw(image);
+}
+
+/// Draw an image that is a message in its own right, with no summary line to
+/// fall back on.
+///
+/// A terminal that cannot show it gets one line naming the image. The base64
+/// was never meant to be read, so it is not printed either way.
+pub fn print_message_image(image: &ImageContent) {
+    if !draw(image) {
+        println!("{}", message_image_summary(image));
+    }
+}
+
+/// The line shown in place of an image this terminal cannot draw. The base64
+/// is never printed: it is not something a person can read.
+fn message_image_summary(image: &ImageContent) -> String {
+    // base64 carries three bytes in every four characters, and a trailing
+    // group of two characters carries one more.
+    let unpadded = image.data.trim_end_matches('=').len();
+    let bytes = unpadded / 4 * 3 + (unpadded % 4).saturating_sub(1);
+    format!("Image: [{}, {bytes} bytes]", image.mime_type)
 }
 
 #[cfg(test)]
@@ -237,6 +271,13 @@ mod tests {
     fn an_undecodable_image_draws_nothing() {
         let image = ImageContent::new("not base64 !!!", "image/png");
         assert!(art_for(&image, Protocol::Kitty, "10x5", DEFAULT_BINARY).is_none());
+    }
+
+    #[test]
+    fn the_fallback_line_describes_the_image_without_dumping_it() {
+        let summary = message_image_summary(&tiny_png());
+        assert_eq!(summary, "Image: [image/png, 89 bytes]");
+        assert!(!summary.contains("iVBOR"));
     }
 
     #[test]
