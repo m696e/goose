@@ -18,9 +18,9 @@ use crate::{
 use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use rmcp::model::{ErrorCode, ErrorData, Notification, Role, ServerNotification};
 #[expect(deprecated)]
-use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
+use rmcp::model::{ContentBlock, LoggingLevel, LoggingMessageNotificationParam};
+use rmcp::model::{ErrorCode, ErrorData, Notification, Role, ServerNotification};
 use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
@@ -321,6 +321,10 @@ fn extract_response_text(messages: &Conversation, return_last_only: bool) -> Str
 
 pub const SUBAGENT_TOOL_REQUEST_TYPE: &str = "subagent_tool_request";
 
+/// A subagent's tool result, carrying only the images it returned: the client
+/// cannot see a subagent's output, so an image it was given would go unnoticed.
+pub const SUBAGENT_TOOL_RESPONSE_TYPE: &str = "subagent_tool_response";
+
 fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
     Box::pin(async move {
         let SubagentRunParams {
@@ -494,6 +498,34 @@ pub fn create_tool_notification(
                 .with_logger(format!("subagent:{}", subagent_id)),
             ),
         ))
+    } else if let MessageContent::ToolResponse(resp) = content {
+        // A subagent's tool results are not displayed, so an image it was given
+        // would never be seen. Only the images are reported: the rest of a
+        // subagent's output is its own working, which nobody asked to watch.
+        let result = resp.tool_result.as_ref().ok()?;
+        let images: Vec<&ContentBlock> = result
+            .content
+            .iter()
+            .filter(|content| matches!(content, ContentBlock::Image(_)))
+            .collect();
+        if images.is_empty() {
+            return None;
+        }
+
+        Some(ServerNotification::LoggingMessageNotification(
+            Notification::new(
+                LoggingMessageNotificationParam::new(
+                    LoggingLevel::Info,
+                    serde_json::json!({
+                        "type": SUBAGENT_TOOL_RESPONSE_TYPE,
+                        "subagent_id": subagent_id,
+                        "tool_request_id": resp.id,
+                        "images": images,
+                    }),
+                )
+                .with_logger(format!("subagent:{}", subagent_id)),
+            ),
+        ))
     } else {
         None
     }
@@ -501,7 +533,10 @@ pub fn create_tool_notification(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_tool_notification, failure_reason, SUBAGENT_TOOL_REQUEST_TYPE};
+    use super::{
+        create_tool_notification, failure_reason, SUBAGENT_TOOL_REQUEST_TYPE,
+        SUBAGENT_TOOL_RESPONSE_TYPE,
+    };
     use crate::agents::state_machine::MAX_TURNS_MESSAGE;
     use crate::conversation::message::{Message, MessageContent};
     use rmcp::model::{CallToolRequestParams, ServerNotification};
@@ -546,6 +581,53 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+
+    #[test]
+    fn create_tool_notification_reports_only_the_images_of_a_tool_response() {
+        use rmcp::model::{CallToolResult, ContentBlock, ImageContent, TextContent};
+
+        let response = MessageContent::tool_response(
+            "req2",
+            Ok(CallToolResult::success(vec![
+                ContentBlock::Text(TextContent::new("Loaded image from /tmp/x.png.")),
+                ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+            ])),
+        );
+
+        let notification =
+            create_tool_notification(&response, "session_1").expect("an image must be reported");
+        let ServerNotification::LoggingMessageNotification(log) = notification else {
+            panic!("expected a logging notification");
+        };
+        let data = log.params.data;
+        assert_eq!(
+            data.get("type").and_then(|v| v.as_str()),
+            Some(SUBAGENT_TOOL_RESPONSE_TYPE)
+        );
+        assert_eq!(
+            data.get("tool_request_id").and_then(|v| v.as_str()),
+            Some("req2")
+        );
+        let images = data.get("images").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(images.len(), 1, "only images travel, not the result text");
+        assert_eq!(
+            images[0].get("mimeType").and_then(|v| v.as_str()),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn create_tool_notification_ignores_a_tool_response_without_images() {
+        use rmcp::model::{CallToolResult, ContentBlock, TextContent};
+
+        let response = MessageContent::tool_response(
+            "req3",
+            Ok(CallToolResult::success(vec![ContentBlock::Text(
+                TextContent::new("just text"),
+            )])),
+        );
+        assert!(create_tool_notification(&response, "session_1").is_none());
     }
 
     #[test]

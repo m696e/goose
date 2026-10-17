@@ -41,7 +41,7 @@ pub(crate) use large_response_handler::max_tool_response_size;
 pub use prompt_manager::PromptManager;
 #[cfg(feature = "scheduler")]
 pub use schedule_tool::ScheduleTool;
-pub use subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE;
+pub use subagent_handler::{SUBAGENT_TOOL_REQUEST_TYPE, SUBAGENT_TOOL_RESPONSE_TYPE};
 pub use subagent_task_config::TaskConfig;
 pub use tool_execution::ToolCallContext;
 pub use types::{RetryConfig, SessionConfig, SuccessCheck};

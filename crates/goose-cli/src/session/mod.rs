@@ -26,7 +26,7 @@ use goose::agents::platform_extensions::developer::shell::{
     parse_shell_output_notification, ShellOutputNotificationParams, ShellOutputStream,
 };
 use goose::agents::AgentEvent;
-use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
+use goose::agents::{SUBAGENT_TOOL_REQUEST_TYPE, SUBAGENT_TOOL_RESPONSE_TYPE};
 use goose::permission::Permission;
 use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
@@ -2368,6 +2368,49 @@ fn handle_mcp_notification(
                                 arguments.as_ref(),
                                 debug,
                             );
+                            return;
+                        }
+                    }
+                }
+
+                if obj.get("type").and_then(|v| v.as_str()) == Some(SUBAGENT_TOOL_RESPONSE_TYPE) {
+                    // A subagent's output is not displayed, so an image it
+                    // looked at would otherwise never be seen.
+                    let images: Vec<rmcp::model::ImageContent> = obj
+                        .get("images")
+                        .and_then(Value::as_array)
+                        .map(|images| {
+                            images
+                                .iter()
+                                .filter_map(|image| serde_json::from_value(image.clone()).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if !images.is_empty() {
+                        let subagent_id = obj
+                            .get("subagent_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("subagent");
+                        if interactive {
+                            let _ = progress_bars.hide();
+                        }
+                        if is_stream_json_mode {
+                            emit_stream_event(&StreamEvent::Notification {
+                                extension_id: extension_id.to_string(),
+                                data: NotificationData::Log {
+                                    message: format!(
+                                        "[{subagent_id}] returned {} image(s)",
+                                        images.len()
+                                    ),
+                                },
+                            });
+                            return;
+                        }
+                        if !is_json_mode {
+                            for image in &images {
+                                crate::session::image_view::print_inline(image);
+                            }
                             return;
                         }
                     }
